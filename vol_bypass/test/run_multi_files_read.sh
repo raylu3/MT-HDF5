@@ -100,20 +100,3 @@ echo "Test 2c: Reading a single dataset in multiple files with Bypass VOL using 
 # echo ""
 # echo "Test 2d: Reading a single dataset in multiple files using H5Dread_multi with Bypass VOL using the thread pool"
 # ./h5_read -t 0 -d ${DIM1}x${DIM2} -f ${NFILES} -l
-
-# The C test must follow the test with Bypass VOL immediately to use info.log file which contains file name and data info
-# echo ""
-# echo "		===================================================================		"
-# echo "Test 3a: Reading single dataset in a single file in C only with no child thread and no thread pool"
-# ./posix_read_mthread -t 0 -d ${DIM1}x${DIM2} -f ${NFILES} -k
-
-# echo ""
-# echo "Test 3b: Reading single dataset in a single file in C only with multi-thread (no thread pool)"
-# ./posix_read_mthread -t ${NTHREADS_FOR_MULTI} -d ${DIM1}x${DIM2} -f ${NFILES} -k
-
-# Avoid checking the correctness of the data if there are more than one section because the thread pool may still be 
-# reading the data during the check.  Each section corresponds to a H5Dread.  Sections are seperated by ### in info.log.
-# The way thread pool is set up doesn't guarantee the data reading is finished during the check.
-# echo ""
-# echo "Test 3c: Reading single dataset in a single file in C only with thread pool"
-# ./posix_read_tpool -t ${NTHREADS_FOR_TPOOL} -d ${DIM1}x${DIM2} -f ${NFILES} -k

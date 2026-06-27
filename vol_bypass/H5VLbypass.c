@@ -39,6 +39,7 @@
 #include <sys/uio.h>
 #include <unistd.h>
 #include <sys/resource.h>
+#include <zlib.h>
 
 /* Public HDF5 headers */
 #include "hdf5.h"
@@ -84,6 +85,7 @@ typedef struct chunk_cb_info_t {
     sel_info_t *selection_info;
     void *rbuf;
     task_queue_t *task_queue;
+    unsigned deflate_level;              /* Deflate level for GZIP filter */
 } chunk_cb_info_t;
 
 /********************* */
@@ -271,6 +273,10 @@ static herr_t get_dtype_info_helper(hid_t type_id, dtype_info_t *type_info_out);
 
 static H5D_space_status_t
 get_dset_space_status(H5VL_bypass_t *dset_obj, hid_t dxpl_id, void **req);
+
+static size_t gzip_inflate(void *src, size_t src_len, void **dst);
+
+static herr_t gather_scatter_data(size_t buf_size, void *uncompressed_buf, hid_t dtype_id, hid_t fspace_sel_id, hid_t mspace_selection_id, void *buf);
 
 /* Functions for task queue for the thread pool to process */
 static herr_t bypass_queue_destroy(task_queue_t *queue, bool need_mutex);
@@ -1519,19 +1525,23 @@ done:
 /* Get the necessary dataset information through the VOL layer */
 static herr_t
 dset_open_helper(H5VL_bypass_t *obj, hid_t dxpl_id, void **req) {
-    herr_t ret_value = 0;
+    herr_t                  ret_value = 0;
     H5VL_dataset_get_args_t get_args;
-    Bypass_dataset_t *dset = NULL;
+    Bypass_dataset_t       *dset = NULL;
+    H5Z_filter_t            filter_type = -1;   /* Used to check GZIP filter   */
+    size_t                  cd_nelmts = 1; /* Number of filter parameters */
+    unsigned                cd_value = 0;  /* Filter parameter            */
 
     assert(obj->type == H5I_DATASET);
     dset = &obj->u.dataset;
 
     /* Initialize values */
-    dset->dcpl_id = H5I_INVALID_HID;
-    dset->space_id = H5I_INVALID_HID;
-    dset->num_filters = 0;
-    dset->layout = H5D_LAYOUT_ERROR;
-    dset->use_native = false;
+    dset->dcpl_id            = H5I_INVALID_HID;
+    dset->space_id           = H5I_INVALID_HID;
+    dset->num_filters        = 0;
+    dset->deflate_level      = 0;
+    dset->layout             = H5D_LAYOUT_ERROR;
+    dset->use_native         = false;
     dset->use_native_checked = false;
 
     /* Retrieve dataset's DCPL, copied from H5Dget_create_plist */
@@ -1583,6 +1593,21 @@ dset_open_helper(H5VL_bypass_t *obj, hid_t dxpl_id, void **req) {
         fprintf(stderr, "dataset has an invalid layout\n");
         ret_value = -1;
         goto done;
+    }
+
+    /* Figure out if GZIP filter alone is enabled.  Reading chunks compressed with GZIP has been added. */
+    if (dset->num_filters == 1 && (filter_type = H5Pget_filter2(dset->dcpl_id, 0, NULL, &cd_nelmts, &cd_value, 0, NULL, NULL)) < 0) {
+        fprintf(stderr, "unable to get the dataset's filter\n");
+        fprintf(stderr, "In %s of %s at line %d: H5Pget_filter2 failed\n", __func__, __FILE__, __LINE__);
+        ret_value = -1;
+        goto done;
+    }
+
+    if (H5Z_FILTER_DEFLATE == filter_type) {
+        if (1 == cd_nelmts)
+            dset->deflate_level = cd_value;
+        else
+            dset->deflate_level = 0;
     }
 
 done:
@@ -1971,7 +1996,7 @@ operate_data_io(int fd, void *buf, size_t size, off_t offset, bool read_data)
 
         do {
             if (read_data) {
-                fprintf(stderr, "%s, %d: offset = %lu, nbytes = %lu\n", __func__, __LINE__, offset, nbytes);
+                //fprintf(stderr, "%s, %d: offset = %lu, nbytes = %lu\n", __func__, __LINE__, offset, nbytes);
                 bytes_processed = pread(fd, buf, nbytes, offset);
             } else
                 bytes_processed = pwrite(fd, buf, nbytes, offset);
@@ -2006,6 +2031,263 @@ operate_data_io(int fd, void *buf, size_t size, off_t offset, bool read_data)
     } /* end while */
 
 done:
+    return ret_value;
+} /* operate_data_io */
+
+/* Read a deflated chunk (compressed with GZIP filter) */
+static herr_t
+read_deflated_data(int fd, void *buf, size_t size, off_t offset, hid_t dtype_id, hid_t fspace_selection_id, hid_t mspace_selection_id)
+{
+    herr_t  ret_value = 0;
+    size_t  nbytes   = 0;  /* # of bytes to read       */
+    ssize_t bytes_processed = -1; /* # of bytes actually read */
+    void    *compressed_buf = NULL;   /* A temporary buffer to read the deflated data chunk */
+    void    *uncompressed_buf = NULL; /* A temporary buffer to hold the inflated data chunk */
+    void    *p = NULL;
+    size_t  buf_size;                 /* Buffer size of the uncompressed chunk to be returned */
+    size_t  compressed_size;          /* Buffer size of the compressed chunk to be preserved  */
+    size_t  result = 0;
+    int     i;
+
+    p = compressed_buf = (void *)malloc(size);
+    compressed_size = size;
+
+    while (size > 0) {
+        nbytes   = 0;
+        bytes_processed = -1;
+
+        /* Trying to read more bytes than the return type can handle is
+         * undefined behavior in POSIX.
+         */
+        if (size > POSIX_MAX_IO_BYTES)
+            nbytes = POSIX_MAX_IO_BYTES;
+        else
+            nbytes = size;
+
+        do {
+            bytes_processed = pread(fd, p, nbytes, offset);
+
+            if (bytes_processed > 0)
+                offset += bytes_processed;
+
+            if (bytes_processed == 0) {
+                fprintf(stderr, "file read encountered EOF\n");
+                ret_value = -1;
+                goto done;
+            }
+
+            /* Error messages for unexpected values of errno */
+            if (-1 == bytes_processed) {
+                switch (errno) {
+                    case EAGAIN:
+                    case EINTR:
+                        break;
+                    default:
+                        fprintf(stderr, "%s, %d: pread/pwrite failed with error: %s\n", __func__, __LINE__, strerror(errno));
+                        ret_value = -1;
+                        goto done;
+                }
+            }
+        } while (-1 == bytes_processed && EINTR == errno);
+
+        if (bytes_processed > 0) {
+            size -= (size_t)bytes_processed;
+            p = (void *)((char *)p + bytes_processed);
+        }
+    } /* end while */
+
+    //fprintf(stderr, "In %s of %s at line %d: size = %lu, offset = %lld\n", __func__, __FILE__, __LINE__, compressed_size, offset);
+
+    /* Uncompress the chunk into a temporary buffer */
+    if ((buf_size = gzip_inflate(compressed_buf, compressed_size, &uncompressed_buf)) < 0) {
+	fprintf(stderr, "In %s of %s at line %d: gzip_inflate failed\n", __func__, __FILE__, __LINE__);
+	ret_value = -1;
+        goto done;
+    }
+
+    /* If some data is selected in the chunk, gather it from the uncompressed buffer.  Then send the data to the memory location */
+    if (gather_scatter_data(buf_size, uncompressed_buf, dtype_id, fspace_selection_id, mspace_selection_id, buf) < 0) {
+	fprintf(stderr, "In %s of %s at line %d: gzip_inflate failed\n", __func__, __FILE__, __LINE__);
+	ret_value = -1;
+        goto done;
+    }
+
+    //fprintf(stderr, "In %s of %s at line %d\n", __func__, __FILE__, __LINE__);
+
+done:
+    if (compressed_buf)
+        free(compressed_buf);
+
+    if (uncompressed_buf)
+        free(uncompressed_buf);
+
+    if (H5Sclose(mspace_selection_id) < 0) {
+        fprintf(stderr, "failed to close memory space selection\n");
+        ret_value = -1;
+    }
+
+    return ret_value;
+} /* read_deflated_data */
+
+/* Uncompress a chunk into a temporary buffer basically using the algorithm in H5Zdeflate.c */
+static size_t
+gzip_inflate(void *src, size_t src_len, void **dst)
+{
+    void     *outbuf = NULL; /* Pointer to new buffer */
+    size_t   ret_value = 0;
+    int      status;        /* Status from zlib operation */
+    z_stream z_strm;     /* zlib parameters */
+    size_t   nalloc = 0; /* Number of bytes for output buffer */
+    size_t   block_size = MB;  /* Inflate the data in blocks, default to 1MB */
+
+
+    block_size = MIN(src_len, MB);
+    outbuf = malloc(block_size);
+    nalloc = block_size;
+
+//fprintf(stderr, "In %s of %s at line %d: nalloc = %lld\n", __func__, __FILE__, __LINE__, nalloc);
+
+    /* Set the uncompression parameters */
+    memset(&z_strm, 0, sizeof(z_strm));
+    z_strm.next_in   = (Bytef *)src;
+    z_strm.avail_in  = src_len;
+    z_strm.next_out  = (Bytef *)outbuf;
+    z_strm.avail_out = nalloc;
+
+    /* Initialize the uncompression routines. TODO: move it to dataset open  */
+    if (Z_OK != inflateInit(&z_strm)) {
+	fprintf(stderr, "In %s of %s at line %d: inflateInit failed\n", __func__, __FILE__, __LINE__);
+	ret_value = -1;
+        goto done;
+    }
+
+    /* Loop to uncompress the buffer */
+    do {
+	/* Uncompress some data */
+	status = inflate(&z_strm, Z_SYNC_FLUSH);
+
+	/* Check if we are done uncompressing data */
+	if (Z_STREAM_END == status)
+	    break; /*done*/
+
+	/* Check for error */
+	if (Z_OK != status) {
+	    (void)inflateEnd(&z_strm);
+	    fprintf(stderr, "In %s of %s at line %d: inflateInit failed\n", __func__, __FILE__, __LINE__);
+	    ret_value = -1;
+            goto done;
+	} else {
+	    /* If we're not done and just ran out of buffer space, get more */
+	    if (0 == z_strm.avail_out) {
+		void *new_outbuf; /* Pointer to new output buffer */
+
+		/* Allocate a buffer twice as big */
+		nalloc *= 2;
+		if (NULL == (new_outbuf = realloc(outbuf, nalloc))) {
+		    (void)inflateEnd(&z_strm);
+		    fprintf(stderr, "In %s of %s at line %d: inflateInit failed\n", __func__, __FILE__, __LINE__);
+		    ret_value = -1;
+		    goto done;
+		} /* end if */
+		outbuf = new_outbuf;
+
+		/* Update pointers to buffer for next set of uncompressed data */
+		z_strm.next_out  = (unsigned char *)outbuf + z_strm.total_out;
+		z_strm.avail_out = (uInt)(nalloc - z_strm.total_out);
+	    } /* end if */
+	}     /* end else */
+    } while (status == Z_OK);
+
+    /* Set return values */
+    *dst      = outbuf;
+    ret_value = z_strm.total_out;
+
+    /* Finish uncompressing the stream */
+    (void)inflateEnd(&z_strm);
+
+done:
+    return ret_value;
+} /* gzip_inflate */
+
+/* Struct for H5Dscatter's callback */
+typedef struct scatter_info_t {
+    void   *src_buf;      /* Source data buffer */
+    size_t read_size;     /* Remaining number of elements to return */
+} scatter_info_t;
+
+static herr_t scatter_cb(const void **src_buf, size_t *src_buf_bytes_used, void *op_data)
+{
+    scatter_info_t *scatter_info = (scatter_info_t *)op_data;
+
+    *src_buf = scatter_info->src_buf;
+    *src_buf_bytes_used = scatter_info->read_size;
+
+    return 0;
+}
+
+/* If some data is selected in the chunk, gather it from the uncompressed buffer.  Then send the data to the memory location */
+static herr_t
+gather_scatter_data(size_t uncompressed_buf_size, void *uncompressed_buf, hid_t dtype_id, hid_t fspace_sel_id, hid_t mspace_sel_id, void *mem_buf)
+{
+    scatter_info_t scatter_info;            /* Operator data for H5Dscatter callback */
+    int select_npoints = 0, mem_sel_npoints = 0;
+    hssize_t fspace_npoints = 0;
+    H5S_sel_type file_sel_type = H5S_SEL_ERROR;
+    void *gathered_buf = NULL;
+    size_t gathered_buf_size = 0;
+    herr_t     ret_value = 0;
+
+    if ((select_npoints = H5Sget_select_npoints(fspace_sel_id)) < 0) {
+	fprintf(stderr, "In %s of %s at line %d: H5Sget_select_npoints failed\n", __func__, __FILE__, __LINE__);
+	ret_value = -1;
+	goto done;
+    }
+
+    //fprintf(stderr, "In %s of %s at line %d: fspace_npoints = %lld, file_sel_type = %d, select_npoints = %d, mem_sel_npoints = %d, uncompressed_buf_size = %lld\n", __func__, __FILE__, __LINE__, fspace_npoints, file_sel_type, select_npoints, mem_sel_npoints, uncompressed_buf_size);
+
+    gathered_buf_size = select_npoints * H5Tget_size(dtype_id);
+
+    /* If some data is selected in the chunk, first gather it from the uncompressed buffer.
+     * Then send the data to the memory location.  If the entire chunk is selected, scatter the data
+     * into the user's buffer directly.
+     */
+    if (uncompressed_buf_size == gathered_buf_size) {
+	/* Set up scatter info */
+	scatter_info.src_buf   = uncompressed_buf;
+	scatter_info.read_size = uncompressed_buf_size;
+
+	if (H5Dscatter ((H5D_scatter_func_t)scatter_cb, &scatter_info, dtype_id, mspace_sel_id, mem_buf) < 0) {
+	    fprintf(stderr, "In %s of %s at line %d: H5Dscatter failed\n", __func__, __FILE__, __LINE__);
+	    ret_value = -1;
+	    goto done;
+	}
+    } else {
+	gathered_buf = malloc(gathered_buf_size);
+
+	if (H5Dgather(fspace_sel_id, uncompressed_buf, dtype_id, gathered_buf_size, gathered_buf, NULL, NULL) < 0) {
+	    fprintf(stderr, "In %s of %s at line %d: H5Dgather failed\n", __func__, __FILE__, __LINE__);
+	    ret_value = -1;
+	    goto done;
+	}
+
+	/* Set up scatter info */
+	scatter_info.src_buf   = gathered_buf;
+	scatter_info.read_size = gathered_buf_size;
+
+	//fprintf(stderr, "In %s of %s at line %d: uncompressed_buf_size = %lld\n", __func__, __FILE__, __LINE__, uncompressed_buf_size);
+
+	if (H5Dscatter ((H5D_scatter_func_t)scatter_cb, &scatter_info, dtype_id, mspace_sel_id, mem_buf) < 0) {
+	    fprintf(stderr, "In %s of %s at line %d: H5Dscatter failed\n", __func__, __FILE__, __LINE__);
+	    ret_value = -1;
+	    goto done;
+	}
+    }
+
+    //fprintf(stderr, "In %s of %s at line %d\n", __func__, __FILE__, __LINE__);
+done:
+    if (gathered_buf)
+        free(gathered_buf);
+
     return ret_value;
 }
 
@@ -2071,13 +2353,26 @@ start_thread_for_pool(void *args)
 	//fprintf(stderr, "\t%s: %d: thread %d before reading data, local_count = %d\n", __func__, __LINE__, thread_id, local_count);
 
 	for (i = 0; i < local_count; i++) {
-	    if (operate_data_io(tasks[i]->file->u.file.fd, tasks[i]->vec_buf, tasks[i]->size,
-		       tasks[i]->addr, tasks[i]->read_data) < 0) {
-	        fprintf(stderr, "operate_data_io failed within file %s, read_data = %d\n", tasks[i]->file->u.file.name, tasks[i]->read_data);
-	        /* Return a failure code, but try to complete the rest of the read request.
-	         * This is important to properly decrement the reference count/num_reads on the local file object */
-	        ret_value = (void *)-1;
-	    }
+	    //fprintf(stderr, "\t%s: %d: thread %d before reading data, size = %ld, addr = %lu\n", __func__, __LINE__, thread_id, tasks[i]->size, tasks[i]->addr);
+
+            /* If deflate level is positive, make it a special case for chunks being compressed with GZIP */
+            if (tasks[i]->deflate_level && tasks[i]->read_data) {
+		if (read_deflated_data(tasks[i]->file->u.file.fd, tasks[i]->vec_buf, tasks[i]->size,
+			   tasks[i]->addr, tasks[i]->dtype_id, tasks[i]->file_space_id, tasks[i]->mem_space_id) < 0) {
+		    fprintf(stderr, "In %s of %s at line %d: read_deflated_data failed\n", __func__, __FILE__, __LINE__);
+		    /* Return a failure code, but try to complete the rest of the read request.
+		     * This is important to properly decrement the reference count/num_reads on the local file object */
+		    ret_value = (void *)-1;
+		}
+            } else {
+		if (operate_data_io(tasks[i]->file->u.file.fd, tasks[i]->vec_buf, tasks[i]->size,
+			   tasks[i]->addr, tasks[i]->read_data) < 0) {
+		    fprintf(stderr, "In %s of %s at line %d: operate_data_io failed\n", __func__, __FILE__, __LINE__);
+		    /* Return a failure code, but try to complete the rest of the read request.
+		     * This is important to properly decrement the reference count/num_reads on the local file object */
+		    ret_value = (void *)-1;
+		}
+            }
 
             if (pthread_mutex_lock(&mutex_local) != 0) {
                 fprintf(stderr, "failed to lock mutex\n");
@@ -2190,8 +2485,7 @@ process_vectors(task_queue_t *task_queue, void *rbuf, sel_info_t *selection_info
 
     if ((file_iter_id =
         H5Ssel_iter_create(selection_info->file_space_id, 
-        selection_info->dtype_size, H5S_SEL_ITER_SHARE_WITH_DATASPACE)) < 0)
-    {
+        selection_info->dtype_size, H5S_SEL_ITER_SHARE_WITH_DATASPACE)) < 0) {
         fprintf(stderr, "H5Ssel_iter_create on filespace failed\n");
         ret_value = -1;
         goto done;
@@ -2199,8 +2493,7 @@ process_vectors(task_queue_t *task_queue, void *rbuf, sel_info_t *selection_info
 
     if ((mem_iter_id =
         H5Ssel_iter_create(selection_info->mem_space_id, 
-        selection_info->dtype_size, H5S_SEL_ITER_SHARE_WITH_DATASPACE)) < 0)
-    {
+        selection_info->dtype_size, H5S_SEL_ITER_SHARE_WITH_DATASPACE)) < 0) {
         fprintf(stderr, "H5Ssel_iter_create on memspace failed\n");
         ret_value = -1;
         goto done;
@@ -2426,10 +2719,102 @@ done:
     return ret_value;
 } /* end of process_vectors() */
 
+/* Handle the special case when the chunk is compressed with GZIP filer */
+static herr_t
+process_deflated_chunk(task_queue_t *task_queue, void *rbuf, sel_info_t *selection_info)
+{
+    int        local_count_for_signal = 0;
+    Bypass_task_t *task = NULL;
+    haddr_t    task_addr   = HADDR_UNDEF;
+    void       *task_buf    = NULL;
+    herr_t     ret_value = 0;
+
+    if (no_tpool) {
+	if ((task = malloc(sizeof(Bypass_task_t))) == NULL) {
+	    fprintf(stderr, "Failed to allocate memory for a task\n");
+	    ret_value = -1;
+	    goto done;
+	}
+
+	if ((task = bypass_task_create(selection_info, selection_info->chunk_addr, selection_info->chunk_size, rbuf)) == NULL) {
+	    fprintf(stderr, "Failed to assemble task while processing vectors\n");
+	    ret_value = -1;
+	    goto done;
+	}
+
+	if (bypass_queue_push(task_queue, task, false) < 0) {
+	    fprintf(stderr, "Failed to push task to queue\n");
+	    ret_value = -1;
+	    goto done;
+	}
+    } else {
+	/* Lock in order to append a task to the task queue */
+	if (pthread_mutex_lock(&mutex_local) != 0) {
+	    fprintf(stderr, "failed to lock local mutex\n");
+	    ret_value = -1;
+	    goto done;
+	}
+
+	if ((task = malloc(sizeof(Bypass_task_t))) == NULL) {
+	    fprintf(stderr, "Failed to allocate memory for a task\n");
+	    ret_value = -1;
+	    goto done;
+	}
+
+	if ((task = bypass_task_create(selection_info, selection_info->chunk_addr, selection_info->chunk_size, rbuf)) == NULL) {
+	    fprintf(stderr, "Failed to assemble task while processing vectors\n");
+	    ret_value = -1;
+	    goto done;
+	}
+
+	if (bypass_queue_push(task_queue, task, false) < 0) {
+	    fprintf(stderr, "Failed to push task to queue\n");
+	    ret_value = -1;
+	    goto done;
+	}
+
+	local_count_for_signal++;
+
+	/* Let the queue accumulate nsteps_tpool entries then signal the thread pool
+	 * to read them */
+	if (local_count_for_signal >= nsteps_tpool) {
+	    pthread_cond_broadcast(&cond_local);
+	    local_count_for_signal = 0;
+	}
+
+	if (pthread_mutex_unlock(&mutex_local) != 0) {
+	    fprintf(stderr, "failed to unlock local mutex\n");
+	    ret_value = -1;
+	    goto done;
+	}
+    }
+
+    /* If there is any leftover entries in the queue, signal the thread pool to
+     * read them.  The tasks have been enqueued earlier. */
+    if (local_count_for_signal > 0 && local_count_for_signal < nsteps_tpool) {
+        if (pthread_mutex_lock(&mutex_local) != 0) {
+	    printf("In %s of %s at line %d: pthread_mutex_lock failed\n", __func__, __FILE__, __LINE__);
+	    ret_value = -1;
+	    goto done;
+        }
+
+        pthread_cond_broadcast(&cond_local);
+
+        if (pthread_mutex_unlock(&mutex_local) != 0) {
+	    printf("In %s of %s at line %d: pthread_mutex_unlock failed\n", __func__, __FILE__, __LINE__);
+	    ret_value = -1;
+	    goto done;
+        }
+    }
+
+done:
+    return ret_value;
+} /* end of process_deflated_chunk() */
+
 static int
 process_chunk_cb(const hsize_t *chunk_offsets, unsigned filter_mask,
-    haddr_t chunk_addr, hsize_t chunk_size, void *op_data) {
-
+    haddr_t chunk_addr, hsize_t chunk_size, void *op_data)
+{
     /* Set to H5_ITER_STOP in case of error here - see note in lib documentation on H5D_chunk_iter_op_t */
     herr_t ret_value = H5_ITER_CONT;
     chunk_cb_info_t *cb_info = (chunk_cb_info_t *)op_data;
@@ -2511,13 +2896,31 @@ process_chunk_cb(const hsize_t *chunk_offsets, unsigned filter_mask,
         goto done;
     }
 
-    /* Save the information for this chunk */
-    cb_info->selection_info->mem_space_id  = mem_selection_id;
-    cb_info->selection_info->file_space_id = cb_info->file_space_copy;
-    cb_info->selection_info->chunk_addr    = chunk_addr;
+    /* Copy the memory dataspace that has the memory selection. TODO: close it after reading chunk finishes */
+    if ((cb_info->selection_info->mem_space_id = H5Scopy(mem_selection_id)) < 0) {
+        printf("In %s of %s at line %d: H5Scopy failed\n", __func__, __FILE__, __LINE__);
+        ret_value = H5_ITER_STOP;
+        goto done;
+    }
 
-    /* Retrieve the pieces of data (vectors) from the chunk and put them into the memory */
-    process_vectors(cb_info->task_queue, cb_info->rbuf, cb_info->selection_info);
+    /* Copy the dataspace that has the file selection. TODO: close it after reading chunk finishes */
+    if ((cb_info->selection_info->file_space_id = H5Scopy(cb_info->file_space_copy)) < 0) {
+        printf("In %s of %s at line %d: H5Scopy failed\n", __func__, __FILE__, __LINE__);
+        ret_value = H5_ITER_STOP;
+        goto done;
+    }
+
+    /* Save the information for this chunk */
+    cb_info->selection_info->chunk_addr    = chunk_addr;
+    cb_info->selection_info->chunk_size    = chunk_size; /* If compressed with GZIP, this is the actual size of the chunk */
+
+    /* If the deflate level is positive, handle the GZIP-compressed chunk as a special case */
+    if (cb_info->selection_info->deflate_level) {
+        process_deflated_chunk(cb_info->task_queue, cb_info->rbuf, cb_info->selection_info);
+    } else {
+        /* Retrieve the pieces of data (vectors) from the chunk and put them into the memory */
+        process_vectors(cb_info->task_queue, cb_info->rbuf, cb_info->selection_info);
+    }
 
 done:
     /* Close the space ID for the memory selection */
@@ -2584,6 +2987,7 @@ static herr_t process_chunks(task_queue_t *task_queue, void *rbuf, void *dset, h
     chunk_cb_info.file_space = file_space;
     chunk_cb_info.mem_space = mem_space;
     chunk_cb_info.selection_info = selection_info;
+    chunk_cb_info.selection_info->deflate_level = dset_obj->u.dataset.deflate_level;
     chunk_cb_info.rbuf = rbuf;
     chunk_cb_info.task_queue = task_queue;
 
@@ -2603,7 +3007,6 @@ done:
     if (H5Sclose(chunk_cb_info.file_space_copy) < 0) {
         fprintf(stderr, "failed to close file space copy\n");
         ret_value = -1;
-        goto done;
     }
 
     return ret_value;
@@ -2781,6 +3184,7 @@ H5VL_bypass_dataset_read(size_t count, void *dset[], hid_t mem_type_id[], hid_t 
                     goto done;
             }
         } else { /* Coming into Bypass VOL when no data conversion and filter */
+            //TODO: change chunk_addr to dataset address
             if (get_dset_location(dset[j], plist_id, req, &selection_info.chunk_addr) < 0) {
                 fprintf(stderr, "failed to get file location of contiguous dataset\n");
                 ret_value = -1;
@@ -2832,6 +3236,9 @@ H5VL_bypass_dataset_read(size_t count, void *dset[], hid_t mem_type_id[], hid_t 
 
             selection_info.dtype_size = bypass_dset->dtype_info.size;
 
+            /* Use the memory datatype ID for reading chunks compressed with GZIP because no conversion is needed */
+            selection_info.dtype_id = mem_type_id[j];
+
 	    /* When the application is multi-threaded, this pointer keeps track of the number of tasks
              * in the queue for the current thread */
 	    selection_info.task_count_ptr = &local_task_count;
@@ -2845,7 +3252,8 @@ H5VL_bypass_dataset_read(size_t count, void *dset[], hid_t mem_type_id[], hid_t 
 
             if (H5D_CHUNKED == bypass_dset->layout) {
                 /* Iterate through all chunks and map the data selection in each chunk to the memory.
-                 * Put the selections into a queue for the thread pool to read the data */
+                 * Put the selections into the shared queue for the thread pool to read the data or into the
+                 * queue local to each thread if no thread pool is used */
                 if (no_tpool) {
                     //printf("%s: %d, in bypass VOL\n", __func__, __LINE__);
 
@@ -2911,12 +3319,22 @@ H5VL_bypass_dataset_read(size_t count, void *dset[], hid_t mem_type_id[], hid_t 
 			goto done;
 		    }
 
-		    if (operate_data_io(task->file->u.file.fd, task->vec_buf, task->size, task->addr, task->read_data) < 0) {
-			fprintf(stderr, "operate_data_io failed within file %s\n", task->file->u.file.name);
-			/* Return a failure code, but try to complete the rest of the read request.
-			 * This is important to properly decrement the reference count/num_reads on the local file object */
-			ret_value = -1;
-		    }
+		    if (task->deflate_level) {
+			if (read_deflated_data(task->file->u.file.fd, task->vec_buf, task->size, task->addr, task->dtype_id,
+                            task->file_space_id, task->mem_space_id) < 0) {
+			    fprintf(stderr, "In %s of %s at line %d: read_deflated_data failed\n", __func__, __FILE__, __LINE__);
+			    /* Return a failure code, but try to complete the rest of the read request.
+			     * This is important to properly decrement the reference count/num_reads on the local file object */
+			    ret_value = -1;
+			}
+		    } else {
+			if (operate_data_io(task->file->u.file.fd, task->vec_buf, task->size, task->addr, task->read_data) < 0) {
+			    fprintf(stderr, "operate_data_io failed within file %s\n", task->file->u.file.name);
+			    /* Return a failure code, but try to complete the rest of the read request.
+			     * This is important to properly decrement the reference count/num_reads on the local file object */
+			    ret_value = -1;
+			}
+                    }
 
 		    if (task != NULL) {
 			bypass_task_release(task);
@@ -3027,6 +3445,8 @@ done:
  * Return:      Success:    0
  *              Failure:    -1
  *
+ * Notes:       This write function is basically a copy of the read function.
+ *              In the future,  this code should be simplified.
  *-------------------------------------------------------------------------
  */
 static herr_t
@@ -5570,6 +5990,13 @@ should_dset_use_native(Bypass_dataset_t* dset, bool read_data) {
 
     assert(dset);
 
+    /* Bypass VOL handles the special case of reading chunked dataset compressed with GZIP */
+    if (read_data && dset->num_filters == 1 && dset->deflate_level > 0) {
+        dset->use_native = false;
+        dset->use_native_checked = true;
+        goto done;
+    }
+ 
     if (dset->num_filters > 0) {
         dset->use_native = true;
         dset->use_native_checked = true;
@@ -6062,6 +6489,10 @@ bypass_task_create(sel_info_t *sel_info, haddr_t addr, size_t size, void *buf) {
     ret_value->task_count_ptr = sel_info->task_count_ptr;
     ret_value->local_condition_ptr = sel_info->local_condition_ptr;
     ret_value->read_data = sel_info->read_data;
+    ret_value->deflate_level = sel_info->deflate_level;
+    ret_value->file_space_id  = sel_info->file_space_id;
+    ret_value->mem_space_id  = sel_info->mem_space_id;
+    ret_value->dtype_id  = sel_info->dtype_id;
 
     /* Will be populated after this task is inserted into queue */
     ret_value->next = NULL;

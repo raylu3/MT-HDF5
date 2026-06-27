@@ -102,6 +102,7 @@ typedef struct Bypass_dataset_t {
     hid_t space_id;
     H5D_layout_t layout;
     int num_filters;
+    unsigned deflate_level;      /* Deflate level for GZIP filter */
     dtype_info_t dtype_info;
     bool use_native;             /* Indicating if using the native library for IO */
     bool use_native_checked;     /* Indicating if using the native library has been decided */
@@ -127,9 +128,13 @@ typedef struct Bypass_task_t Bypass_task_t;
 typedef struct Bypass_task_t {
     H5VL_bypass_t *file;
     haddr_t        addr;                 /* Location of filesystem file to read from or write to*/
-    size_t         size;
+    size_t         size;                 /* Data size to be read or written */
     void          *vec_buf;              /* User buffer */
     bool           read_data;            /* reading or writing data */
+    unsigned       deflate_level;        /* Deflate level for GZIP filter if used */
+    hid_t          dtype_id;             /* ID for the datatype */
+    hid_t          file_space_id;        /* file selection. Used only for chunks compressed by GZIP filter to gather selected file data */
+    hid_t          mem_space_id;         /* Memory selection. Used only for chunks compressed by GZIP filter to scatter data into memory buffer */
     atomic_int    *task_count_ptr;       /* These two fields are used for multi-threaded application (not using the thread pool).
                                           * This pointer keeps track of the number of tasks in the queue for the current thread */
     pthread_cond_t *local_condition_ptr; /* This pointer passes the local condition variable for the current thread to the thread pool */
@@ -155,15 +160,17 @@ typedef struct {
     hid_t   file_space_id;
     hid_t   mem_space_id;
     haddr_t chunk_addr;
-
+    hsize_t chunk_size;  /* If compressed with GZIP, this is the actual size of the chunk */
     H5VL_bypass_t *file; // TODO: Replace this and names above with dset pointer
-    int     dtype_size;
+    size_t  dtype_size;
+    hid_t   dtype_id;
 
     bool    memory_allocated;
     atomic_int    *task_count_ptr;       /* These two fields are used for multi-threaded application (not using the thread pool).
                                           * This pointer keeps track of the number of tasks in the queue for the current thread */
     pthread_cond_t *local_condition_ptr; /* This pointer passes the local condition variable for the current thread to the thread pool */
     bool    read_data;                   /* reading or writing data */
+    unsigned       deflate_level;        /* Deflate level for GZIP filter if used */
 } sel_info_t;
 
 static info_t *info_stuff;

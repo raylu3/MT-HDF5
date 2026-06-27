@@ -37,6 +37,7 @@ typedef struct {
     long long int   chunk_dim1;
     long long int   chunk_dim2;
     int   space_select;
+    int   deflate_level;
     bool  chunk_cache;
     bool  check_data;
     bool  random_data;
