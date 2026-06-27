@@ -72,7 +72,11 @@ int create_files()
         chunk_dims[0] = hand.chunk_dim1;
         chunk_dims[1] = hand.chunk_dim2;
           
-        H5Pset_chunk(dcpl, RANK, chunk_dims); 
+        H5Pset_chunk(dcpl, RANK, chunk_dims);
+
+        /* Enable GZIP filter for the chunked dataset if set */
+        if (hand.deflate_level > 0)
+            H5Pset_deflate(dcpl, hand.deflate_level);
     }
 
     /* Create the dataspace */

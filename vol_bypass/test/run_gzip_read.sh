@@ -9,21 +9,29 @@
 #     NDATA_SECTIONS:     number of dataset sections to break down big datasets by rows in case they are bigger than the memory size.
 #                         e.g. if the memory size is 32GB, datasets of 64GB won't fit in.  This option breaks down the datasets
 #                         in sections for creation and reading. Remember to avoid break down small datasets in case unexpected errors.
+#     DEFLATE_LEVEL:      the compression level of the GZIP filter
 #     DIM1:               dataset dimension one
 #     DIM2:               dataset dimension two
 #     CHUNK_DIM1:         chunk dimension one
 #     CHUNK_DIM2:         chunk dimension two
 NTHREADS_FOR_MULTI=4
 NTHREADS_FOR_TPOOL=4
-NSTEPS_QUEUE=1024
+NSTEPS_QUEUE=1
 MAX_NELMTS=1048576
 NDATA_SECTIONS=4
+DEFLATE_LEVEL=9
 
 # Dataset size = 32x4 bytes
 # DIM1=4
 # DIM2=4
 # CHUNK_DIM1=2
 # CHUNK_DIM2=2
+
+# Dataset size = 32x4 bytes
+# DIM1=16
+# DIM2=16
+# CHUNK_DIM1=4
+# CHUNK_DIM2=4
 
 # Dataset size = 4MB
 DIM1=1024
@@ -49,8 +57,8 @@ CHUNK_DIM2=64
 # CHUNK_DIM1=8192
 # CHUNK_DIM2=8192
 
-echo "Test 0: Creating a HDF5 file with a single dataset in it"
-./h5_create -d ${DIM1}x${DIM2} -c ${CHUNK_DIM1}x${CHUNK_DIM2} -q ${NDATA_SECTIONS}
+echo "Test 0: Creating a HDF5 file with a single dataset in it with GZIP"
+./h5_create -d ${DIM1}x${DIM2} -c ${CHUNK_DIM1}x${CHUNK_DIM2} -q ${NDATA_SECTIONS} -z ${DEFLATE_LEVEL}
 
 # Make sure these two environment variables aren't set in order to run the test without Bypass VOL
 unset HDF5_VOL_CONNECTOR

@@ -18,16 +18,16 @@ MAX_NELMTS=1048576
 NDATA_SECTIONS=4
 
 # Dataset size = 1KB
-# DIM1=16
-# DIM2=16
+# DIM1=4
+# DIM2=4
 
 # Dataset size = 4MB
-DIM1=1024
-DIM2=1024
+# DIM1=1024
+# DIM2=1024
 
 # Dataset size = 64MB
-# DIM1=4096
-# DIM2=4096
+DIM1=4096
+DIM2=4096
 
 # Dataset size = 16GB
 # DIM1=65536

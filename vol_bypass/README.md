@@ -7,6 +7,14 @@ This VOL connector was tested with the version of the HDF5 1.14.2 release with m
 If you don't have the shared dynamic libraries, you'll need to reinstall HDF5.
 
 - Get the 1.14.2 release of HDF5 with multithread support located at https://github.com/LifeboatLLC/hdf5_lifeboat (the 1_14_2_multithread branch);
+- The recent version has a bug.  To avoid it temporarily, you can check out an earlier version (a92a9b5) by doing 'git checkout a92a9b5'.
+- A side note: the implementation of Exclusive-shared lock will finish soon. Before that happens, the Bypass VOL uses the global lock of the HDF5 library as a temporary solution.  The users need to manually add a public function H5TShave_mutex into the HDF5 library's source code. In hdf5/src/H5TSdevelop.h, add the function prototype: ```H5_DLL herr_t H5TShave_mutex(bool *have_mutex_ptr);```
+In hdf5/src/H5TS.c, add the following function definition: 
+```
+herr_t H5TShave_mutex(bool *have_mutex_ptr){
+    FUNC_ENTER_API_NAMECHECK_ONLY
+    FUNC_LEAVE_API_NAMECHECK_ONLY(H5TS_have_mutex(&H5_g.init_lock, have_mutex_ptr))}
+```
 - In the HDF5 source directory, run: ./autogen.sh
 - In your build directory, run configure and make sure to enable multithread feature.  To benchmark performance, you need to build the production.  You only need the shared dynamic library.  So remember to disable the static library.  For example:
     >    ../hdf5/configure --enable-multithread --disable-hl --enable-build-mode=production --disable-static
@@ -41,6 +49,7 @@ Below are the scripts to run the benchmark for reading data:
 - run_contiguous_read.sh
 - run_multi_dsets_read.sh
 - run_multi_files_read.sh
+- run_gzip_read.sh
 
 The scripts to run the benchmark for writing data are as below:
 
@@ -65,19 +74,19 @@ The full list of command line options for the test programs (both h5_read.c and 
     % ./h5_read --help     
 
     Help page:
-	    [-h] [-c --dimsChunk] [-d --dimsDset] [-e --enableChunkCache] [-f --nFiles] [-k --checkData] [-m -stepSize] [-n --nDsets] [-q --nSections] [-r --randomData] [-s --spaceSelect] [-t --nThreads]
-	    [-h --help]: this help page
-	    [-c --dimsChunk]: the 2D dimensions of the chunks.  The default is no chunking.
-	    [-d --dimsDset]: the 2D dimensions of the datasets.  The default is 1024 x 1024.
-	    [-e --enableChunkCache]: enable chunk cache for better data I/O performance in HDF5 library (not in Bypass VOL). The default is disabled.
-	    [-f --nFiles]: for testing multiple files, this number must be a multiple of the number of threads.  The default is 1.
-	    [-k --checkData]: make sure the data is correct while not running for benchmark. The default is false.
-	    [-l --multiDsets]: read multiple datasets using H5Dread_multi. The default is false.
-	    [-m --stepSize]: the number of data pieces passed into the thread pool.  The default is 1.
-	    [-n --nDsets]: number of datasets in a single file.  The default is 1.
-	    [-q --nSections]: number of data sections to break down a large dataset.  The default is 1.
-	    [-r --randomData]: the data has random values. The default is false.
-	    [-s --spaceSelect]: hyperslab selection of data space.  The default is the rows divided by the number of threads - value 1
-		    The other options are unsurppoted
-	    [-t --nThreads]: number of child threads in addition to the main process.  The default is 1.
-
+	[-h] [-c --dimsChunk] [-d --dimsDset] [-e --enableChunkCache] [-f --nFiles] [-k --checkData] [-m -stepSize] [-n --nDsets] [-q --nSections] [-r --randomData] [-s --spaceSelect] [-t --nThreads] [-z --deflateLevel]
+	[-h --help]: this help page
+	[-c --dimsChunk]: the 2D dimensions of the chunks.  The default is no chunking.
+	[-d --dimsDset]: the 2D dimensions of the datasets.  The default is 1024 x 1024.
+	[-e --enableChunkCache]: enable chunk cache for better data I/O performance in HDF5 library (not in Bypass VOL). The default is disabled.
+	[-f --nFiles]: for testing multiple files, this number must be a multiple of the number of threads.  The default is 1.
+	[-k --checkData]: make sure the data is correct while not running for benchmark. The default is false.
+	[-l --multiDsets]: read multiple datasets using H5Dread_multi. The default is false.
+	[-m --stepSize]: the number of data pieces passed into the thread pool.  The default is 1.
+	[-n --nDsets]: number of datasets in a single file.  The default is 1.
+	[-q --nSections]: number of data sections to break down a large dataset.  The default is 1.
+	[-r --randomData]: the data has random values. The default is false.
+	[-s --spaceSelect]: hyperslab selection of data space.  The default is the rows divided by the number of threads - value 1
+		The other options are unsurppoted
+	[-t --nThreads]: number of child threads in addition to the main process.  The default is 1.
+	[-z --deflateLevel]: for testing reading chunked data compressed with GZIP (1 - 9).  The default is 0 (no compression).

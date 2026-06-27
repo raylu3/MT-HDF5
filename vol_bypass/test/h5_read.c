@@ -132,7 +132,7 @@ void* read_partial_dset_with_hdf5(void* arg)
 	    offset[1] = 0;
 	    count[1]  = hand.dset_dim2;
 
-//printf("In %s, thread_id=%d: offset[0]=%d, offset[1]=%d, count[0]=%d, count[1]=%d\n", __func__, thread_id, offset[0], offset[1], count[0], count[1]);
+            //printf("In %s, thread_id=%d: offset[0]=%d, offset[1]=%d, count[0]=%d, count[1]=%d\n", __func__, thread_id, offset[0], offset[1], count[0], count[1]);
 	    status = H5Sselect_hyperslab(dataspace, H5S_SELECT_SET, offset, NULL, count, NULL);
 	    status = H5Sselect_hyperslab(memspace, H5S_SELECT_SET, offset, NULL, count, NULL);
 

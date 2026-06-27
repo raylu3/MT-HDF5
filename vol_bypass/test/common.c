@@ -7,7 +7,7 @@
 void
 usage(void)
 {
-    printf("    [-h] [-c --dimsChunk] [-d --dimsDset] [-e --enableChunkCache] [-f --nFiles] [-k --checkData] [-m -stepSize] [-n --nDsets] [-q --nSections] [-r --randomData] [-s --spaceSelect] [-t --nThreads]\n");
+    printf("    [-h] [-c --dimsChunk] [-d --dimsDset] [-e --enableChunkCache] [-f --nFiles] [-k --checkData] [-m -stepSize] [-n --nDsets] [-q --nSections] [-r --randomData] [-s --spaceSelect] [-t --nThreads] [-z --deflateLevel]\n");
     printf("    [-h --help]: this help page\n");
     printf("    [-c --dimsChunk]: the 2D dimensions of the chunks.  The default is no chunking.\n");
     printf("    [-d --dimsDset]: the 2D dimensions of the datasets.  The default is 1024 x 1024.\n");
@@ -22,6 +22,7 @@ usage(void)
     printf("    [-s --spaceSelect]: hyperslab selection of data space.  The default is the rows divided by the number of threads - value 1\n");
     printf("            The other options are unsurppoted\n");
     printf("    [-t --nThreads]: number of child threads in addition to the main process.  The default is 1.\n");
+    printf("    [-z --deflateLevel]: for testing reading chunked data compressed with GZIP (1 - 9).  The default is 0 (no compression).\n");
     printf("\n");
 }
 
@@ -47,6 +48,7 @@ parse_command_line(int argc, char *argv[])
                                     {"spaceSelect=", required_argument, NULL, 's'},
                                     {"nThreads=", required_argument, NULL, 't'},
                                     {"multiDsets", no_argument, NULL, 'l'},
+                                    {"deflateLevel=", required_argument, NULL, 'z'},
                                     {NULL, 0, NULL, 0}};
 
     /* Initialize the command line options */
@@ -66,8 +68,9 @@ parse_command_line(int argc, char *argv[])
     hand.chunk_dim1               = 0; /* No chunking.  Contiguous is the default. */
     hand.chunk_dim2               = 0; /* No chunking.  Contiguous is the default. */
     hand.space_select             = 1; /* Other values are not supported           */
+    hand.deflate_level            = 0; /* No compression for GZIP                  */
 
-    while ((opt = getopt_long(argc, argv, "c:d:ef:hklm:n:q:rs:t:", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "c:d:ef:hklm:n:q:rs:t:z:", long_options, NULL)) != -1) {
         switch (opt) {
             case 'c':
                 /* The dimensions of the chunks */
@@ -162,7 +165,7 @@ parse_command_line(int argc, char *argv[])
                 break;
             case 'r':
                 /* Assign random values to the data during file creation */
-                fprintf(stdout, "assign random values to the data:\t\t\t\tTrue\n");
+                fprintf(stdout, "assign random values to the data:\t\t\tTrue\n");
                 hand.random_data = true;
 
                 break;
@@ -186,6 +189,15 @@ parse_command_line(int argc, char *argv[])
                 if (optarg) {
                     fprintf(stdout, "number of child threads:\t\t\t\t%s\n", optarg);
                     hand.num_threads = atoi(optarg);
+                }
+                else
+                    printf("optarg is null\n");
+                break;
+            case 'z':
+                /* The deflate level of GZIP for chunked dataset to be tested */
+                if (optarg) {
+                    fprintf(stdout, "deflate level of GZIP filter:\t\t\t\t%s\n", optarg);
+                    hand.deflate_level = atoi(optarg);
                 }
                 else
                     printf("optarg is null\n");
@@ -238,6 +250,11 @@ parse_command_line(int argc, char *argv[])
 
     if (hand.random_data == true && hand.check_data == true) {
         printf("Error: Can't verify the correctness of the data if its values are random\n");
+        exit(1);
+    }
+
+    if (hand.deflate_level < 0 || hand.deflate_level > 9) {
+        printf("Error: the deflate level of GZIP filter must be between 0 and 9\n");
         exit(1);
     }
 }

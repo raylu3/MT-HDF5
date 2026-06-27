@@ -93,23 +93,3 @@ echo "Test 2d: Reading single dataset in a single file with Bypass VOL with thre
 # valgrind --tool=helgrind --error-limit=no ./h5_read -t 0 -d ${DIM1}x${DIM2} -q ${NDATA_SECTIONS}
 # valgrind --tool=callgrind --separate-threads=yes --error-limit=no ./h5_read -t 0 -d ${DIM1}x${DIM2} -q ${NDATA_SECTIONS}
 ./h5_read -t 0 -d ${DIM1}x${DIM2} -q ${NDATA_SECTIONS}
-
-# The C test must follow the test with Bypass VOL immediately to use info.log file which contains file name and data info
-# echo ""
-# echo ""
-# echo "		===================================================================		"
-# echo "Test 3a: Reading single dataset in a single file in C only with no child thread (serial)"
-# ./posix_read_mthread -t 0 -d ${DIM1}x${DIM2} -q ${NDATA_SECTIONS}
-
-# echo ""
-# echo ""
-# echo "Test 3b: Reading single dataset in a single file in C only with multi-thread (no thread pool)"
-# ./posix_read_mthread -t ${NTHREADS_FOR_MULTI} -d ${DIM1}x${DIM2} -q ${NDATA_SECTIONS}
-
-# The C test must follow the test with Bypass VOL immediately to use info.log file which contains file name and data info
-# Avoid checking the correctness of the data if there are more than one section because the thread pool may still be 
-# reading the data during the check.  Each section corresponds to a H5Dread.  Sections are seperated by ### in info.log.
-# The way thread pool is set up doesn't guarantee the data reading is finished during the check.
-# echo ""
-# echo "Test 3c: Reading single dataset in a single file in C only with thread pool"
-# ./posix_read_tpool -t ${NTHREADS_FOR_TPOOL} -d ${DIM1}x${DIM2} -m ${NSTEPS_QUEUE} -q ${NDATA_SECTIONS}
