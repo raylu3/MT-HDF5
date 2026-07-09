@@ -11,9 +11,11 @@ If you don't have the shared dynamic libraries, you'll need to reinstall HDF5.
 - A side note: the implementation of Exclusive-shared lock will finish soon. Before that happens, the Bypass VOL uses the global lock of the HDF5 library as a temporary solution.  The users need to manually add a public function H5TShave_mutex into the HDF5 library's source code. In hdf5/src/H5TSdevelop.h, add the function prototype: ```H5_DLL herr_t H5TShave_mutex(bool *have_mutex_ptr);```
 In hdf5/src/H5TS.c, add the following function definition: 
 ```
-herr_t H5TShave_mutex(bool *have_mutex_ptr){
-    FUNC_ENTER_API_NAMECHECK_ONLY
-    FUNC_LEAVE_API_NAMECHECK_ONLY(H5TS_have_mutex(&H5_g.init_lock, have_mutex_ptr))}
+    herr_t H5TShave_mutex(bool *have_mutex_ptr)
+    {
+        FUNC_ENTER_API_NAMECHECK_ONLY
+        FUNC_LEAVE_API_NAMECHECK_ONLY(H5TS_have_mutex(&H5_g.init_lock, have_mutex_ptr))
+    }
 ```
 - In the HDF5 source directory, run: ./autogen.sh
 - In your build directory, run configure and make sure to enable multithread feature.  To benchmark performance, you need to build the production.  You only need the shared dynamic library.  So remember to disable the static library.  For example:
