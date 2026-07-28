@@ -44,6 +44,11 @@
 /* Public HDF5 headers */
 #include "hdf5.h"
 
+/* Recursive exclusive/shared lock header */
+#ifdef XSLOCK
+#include "BPTS.h"
+#endif
+
 /* This connector's private header */
 #include "H5VLbypass_private.h"
 
@@ -284,6 +289,9 @@ static herr_t bypass_queue_push(task_queue_t *queue, Bypass_task_t *task, bool n
 static Bypass_task_t * bypass_queue_pop(task_queue_t *queue, bool need_mutex);
 static Bypass_task_t * bypass_task_create(sel_info_t *sel_info, haddr_t addr, size_t io_len, void *buf);
 static herr_t bypass_task_release(Bypass_task_t *task);
+
+/* For exclusive/shared lock */
+static herr_t x2s(void *x2s_data_ptr);
 
 /*******************/
 /* Local variables */
@@ -580,7 +588,6 @@ done:
     return ret_value;
 } /* end H5VL_bypass_free_obj() */
 
-
 /*-------------------------------------------------------------------------
  * Function:    H5VL_bypass_register
  *
@@ -604,6 +611,19 @@ H5VL_bypass_register(void)
 
     return H5VL_BYPASS_g;
 } /* end H5VL_bypass_register() */
+
+#ifdef XSLOCK
+static herr_t x2s(void *x2s_data_ptr)
+{
+    int64_t *counter = (int64_t *)x2s_data_ptr;
+
+    assert(x2s_data_ptr);
+    assert(counter);
+    (*counter)++;
+
+    return(SUCCEED);
+} /* x2s() */
+#endif
 
 /*-------------------------------------------------------------------------
  * Function:    H5VL_bypass_init
@@ -702,6 +722,11 @@ H5VL_bypass_init(hid_t vipl_id)
     }
 
     pthread_mutexattr_destroy(&attr);
+
+#ifdef XSLOCK
+    /* Initialize exclusive/shared lock */
+    BPTS_pt_rec_xs_lock_init(&rec_xs_lock, BPTS__XS_LOCK_POLICY__FAVOR_EXCLUSIVE_ACCESS, &x2s, &calls_to_x2s_func);
+#endif
 
     return 0;
 } /* end H5VL_bypass_init() */
@@ -816,6 +841,17 @@ H5VL_bypass_term(void)
     pthread_mutex_destroy(&mutex_local);
     pthread_cond_destroy(&cond_local);
 
+#ifdef XSLOCK
+    /* Verify the expected stats */
+    BPTS_pt_rec_xs_lock_get_stats(&rec_xs_lock, &stats);
+
+    /* Print out the statistics of the Exclusive/shared lock */
+    BPTS_pt_rec_xs_lock_print_stats("Actual stats", &stats);
+
+    /* For exclusive/shared lock */
+    BPTS_pt_rec_xs_lock_takedown(&rec_xs_lock);
+#endif
+
 done:
     if (locked)
         pthread_mutex_unlock(&mutex_local);
@@ -838,9 +874,20 @@ H5VL_bypass_info_copy(const void *_info)
 {
     const H5VL_bypass_info_t *info = (const H5VL_bypass_info_t *)_info;
     H5VL_bypass_info_t       *new_info = NULL;
+    bool                     locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL INFO Copy\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     /* Allocate new VOL info struct for the bypass connector */
@@ -851,6 +898,14 @@ H5VL_bypass_info_copy(const void *_info)
     H5Iinc_ref(new_info->under_vol_id);
     if (info->under_vol_info)
         H5VLcopy_connector_info(new_info->under_vol_id, &(new_info->under_vol_info), info->under_vol_info);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return new_info;
 } /* end H5VL_bypass_info_copy() */
@@ -871,9 +926,22 @@ H5VL_bypass_info_cmp(int *cmp_value, const void *_info1, const void *_info2)
 {
     const H5VL_bypass_info_t *info1 = (const H5VL_bypass_info_t *)_info1;
     const H5VL_bypass_info_t *info2 = (const H5VL_bypass_info_t *)_info2;
+    bool                     locked = false;
+    herr_t                   ret_value = -1;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL INFO Compare\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        ret_value = -1;
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     /* Sanity checks */
@@ -893,7 +961,16 @@ H5VL_bypass_info_cmp(int *cmp_value, const void *_info1, const void *_info2)
     if (*cmp_value != 0)
         return 0;
 
-    return 0;
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+        ret_value = -1;
+    }
+#endif
+
+    return ret_value;
 } /* end H5VL_bypass_info_cmp() */
 
 /*---------------------------------------------------------------------------
@@ -914,9 +991,22 @@ H5VL_bypass_info_free(void *_info)
 {
     H5VL_bypass_info_t *info = (H5VL_bypass_info_t *)_info;
     hid_t               err_id = H5I_INVALID_HID;
+    bool                locked = false;
+    herr_t              ret_value = 0;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL INFO Free\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        ret_value = -1;
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     err_id = H5Eget_current_stack();
@@ -931,7 +1021,16 @@ H5VL_bypass_info_free(void *_info)
     /* Free bypass info object itself */
     free(info);
 
-    return 0;
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+        ret_value = -1;
+    }
+#endif
+
+    return ret_value;
 } /* end H5VL_bypass_info_free() */
 
 /*---------------------------------------------------------------------------
@@ -951,9 +1050,22 @@ H5VL_bypass_info_to_str(const void *_info, char **str)
     H5VL_class_value_t        under_value       = (H5VL_class_value_t)-1;
     char                     *under_vol_string  = NULL;
     size_t                    under_vol_str_len = 0;
+    bool                      locked = false;
+    herr_t                    ret_value = 0;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL INFO To String\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        ret_value = -1;
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     /* Get value and string for underlying VOL connector */
@@ -980,7 +1092,16 @@ H5VL_bypass_info_to_str(const void *_info, char **str)
     if (under_vol_string)
         H5free_memory(under_vol_string);
 
-    return 0;
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+        ret_value = -1;
+    }
+#endif
+
+    return ret_value;
 } /* end H5VL_bypass_info_to_str() */
 
 /*---------------------------------------------------------------------------
@@ -1001,9 +1122,22 @@ H5VL_bypass_str_to_info(const char *str, void **_info)
     const char         *under_vol_info_start, *under_vol_info_end;
     hid_t               under_vol_id = H5I_INVALID_HID;
     void               *under_vol_info = NULL;
+    bool                locked = false;
+    herr_t              ret_value = 0;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL INFO String To Info\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        ret_value = -1;
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     /* Retrieve the underlying VOL connector value and info */
@@ -1033,7 +1167,16 @@ H5VL_bypass_str_to_info(const char *str, void **_info)
     /* Set return value */
     *_info = info;
 
-    return 0;
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+        ret_value = -1;
+    }
+#endif
+
+    return ret_value;
 } /* end H5VL_bypass_str_to_info() */
 
 /*---------------------------------------------------------------------------
@@ -1208,9 +1351,20 @@ H5VL_bypass_attr_create(void *obj, const H5VL_loc_params_t *loc_params, const ch
     H5VL_bypass_t *attr = NULL;
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     void          *under = NULL;
+    bool          locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL ATTRIBUTE Create\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     under = H5VLattr_create(o->under_object, loc_params, o->under_vol_id, name, type_id, space_id, acpl_id,
@@ -1224,6 +1378,14 @@ H5VL_bypass_attr_create(void *obj, const H5VL_loc_params_t *loc_params, const ch
     } /* end if */
     else
         attr = NULL;
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return (void *)attr;
 } /* end H5VL_bypass_attr_create() */
@@ -1245,9 +1407,20 @@ H5VL_bypass_attr_open(void *obj, const H5VL_loc_params_t *loc_params, const char
     H5VL_bypass_t *attr = NULL;
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     void          *under = NULL;
+    bool          locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL ATTRIBUTE Open\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     under = H5VLattr_open(o->under_object, loc_params, o->under_vol_id, name, aapl_id, dxpl_id, req);
@@ -1260,6 +1433,14 @@ H5VL_bypass_attr_open(void *obj, const H5VL_loc_params_t *loc_params, const char
     } /* end if */
     else
         attr = NULL;
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return (void *)attr;
 } /* end H5VL_bypass_attr_open() */
@@ -1278,10 +1459,22 @@ static herr_t
 H5VL_bypass_attr_read(void *attr, hid_t mem_type_id, void *buf, hid_t dxpl_id, void **req)
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)attr;
+    bool           locked = false;
     herr_t         ret_value = 0;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL ATTRIBUTE Read\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        ret_value = -1;
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     ret_value = H5VLattr_read(o->under_object, o->under_vol_id, mem_type_id, buf, dxpl_id, req);
@@ -1289,6 +1482,15 @@ H5VL_bypass_attr_read(void *attr, hid_t mem_type_id, void *buf, hid_t dxpl_id, v
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, o->under_vol_id);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+        ret_value = -1;
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_attr_read() */
@@ -1307,10 +1509,22 @@ static herr_t
 H5VL_bypass_attr_write(void *attr, hid_t mem_type_id, const void *buf, hid_t dxpl_id, void **req)
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)attr;
+    bool           locked = false;
     herr_t         ret_value = 0;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL ATTRIBUTE Write\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        ret_value = -1;
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     ret_value = H5VLattr_write(o->under_object, o->under_vol_id, mem_type_id, buf, dxpl_id, req);
@@ -1318,6 +1532,15 @@ H5VL_bypass_attr_write(void *attr, hid_t mem_type_id, const void *buf, hid_t dxp
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, o->under_vol_id);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+        ret_value = -1;
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_attr_write() */
@@ -1336,10 +1559,22 @@ static herr_t
 H5VL_bypass_attr_get(void *obj, H5VL_attr_get_args_t *args, hid_t dxpl_id, void **req)
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
+    bool           locked = false;
     herr_t         ret_value = 0;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL ATTRIBUTE Get\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        ret_value = -1;
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     ret_value = H5VLattr_get(o->under_object, o->under_vol_id, args, dxpl_id, req);
@@ -1347,6 +1582,15 @@ H5VL_bypass_attr_get(void *obj, H5VL_attr_get_args_t *args, hid_t dxpl_id, void 
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, o->under_vol_id);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+        ret_value = -1;
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_attr_get() */
@@ -1366,10 +1610,22 @@ H5VL_bypass_attr_specific(void *obj, const H5VL_loc_params_t *loc_params, H5VL_a
                           hid_t dxpl_id, void **req)
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
+    bool           locked = false;
     herr_t         ret_value = 0;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL ATTRIBUTE Specific\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        ret_value = -1;
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     ret_value = H5VLattr_specific(o->under_object, loc_params, o->under_vol_id, args, dxpl_id, req);
@@ -1377,6 +1633,15 @@ H5VL_bypass_attr_specific(void *obj, const H5VL_loc_params_t *loc_params, H5VL_a
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, o->under_vol_id);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+        ret_value = -1;
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_attr_specific() */
@@ -1395,10 +1660,22 @@ static herr_t
 H5VL_bypass_attr_optional(void *obj, H5VL_optional_args_t *args, hid_t dxpl_id, void **req)
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
+    bool           locked = false;
     herr_t         ret_value = 0;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL ATTRIBUTE Optional\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        ret_value = -1;
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     ret_value = H5VLattr_optional(o->under_object, o->under_vol_id, args, dxpl_id, req);
@@ -1406,6 +1683,15 @@ H5VL_bypass_attr_optional(void *obj, H5VL_optional_args_t *args, hid_t dxpl_id, 
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, o->under_vol_id);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+        ret_value = -1;
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_attr_optional() */
@@ -1424,10 +1710,22 @@ static herr_t
 H5VL_bypass_attr_close(void *attr, hid_t dxpl_id, void **req)
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)attr;
+    bool           locked = false;
     herr_t         ret_value = 0;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL ATTRIBUTE Close\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        ret_value = -1;
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     ret_value = H5VLattr_close(o->under_object, o->under_vol_id, dxpl_id, req);
@@ -1439,6 +1737,15 @@ H5VL_bypass_attr_close(void *attr, hid_t dxpl_id, void **req)
     /* Release our wrapper, if underlying attribute was closed */
     if (ret_value >= 0)
         H5VL_bypass_free_obj(o);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+        ret_value = -1;
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_attr_close() */
@@ -1649,12 +1956,22 @@ H5VL_bypass_dataset_create(void *obj, const H5VL_loc_params_t *loc_params, const
     printf("------- BYPASS  VOL DATASET Create\n");
 #endif
 
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto error;
+    }
+
+    locked = true;
+#else
     if (pthread_mutex_lock(&mutex_local) < 0) {
         printf("In %s of %s at line %d: pthread_mutex_lock failed\n", __func__, __FILE__, __LINE__);
         goto error;
     }
 
     locked = true;
+#endif
 
     if ((under = H5VLdataset_create(o->under_object, loc_params, o->under_vol_id, name,
         lcpl_id, type_id, space_id, dcpl_id, dapl_id, dxpl_id, req)) == NULL) {
@@ -1699,10 +2016,17 @@ H5VL_bypass_dataset_create(void *obj, const H5VL_loc_params_t *loc_params, const
         req_created = true;
     }
 
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#else
     if (locked && pthread_mutex_unlock(&mutex_local) != 0) {
         printf("In %s of %s at line %d: pthread_mutex_unlock failed\n", __func__, __FILE__, __LINE__);
         goto error;
     }
+#endif
 
     return (void *)dset;
 
@@ -1714,8 +2038,15 @@ error:
             H5VL_bypass_free_obj(*req);
     }
 
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#else
     if (locked)
         pthread_mutex_unlock(&mutex_local);
+#endif
 
     return NULL;
 } /* end H5VL_bypass_dataset_create() */
@@ -1745,12 +2076,22 @@ H5VL_bypass_dataset_open(void *obj, const H5VL_loc_params_t *loc_params, const c
     printf("------- BYPASS  VOL DATASET Open\n");
 #endif
 
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto error;
+    }
+
+    locked = true;
+#else
     if (pthread_mutex_lock(&mutex_local) < 0) {
         printf("In %s of %s at line %d: pthread_mutex_lock failed\n", __func__, __FILE__, __LINE__);
         goto error;
     }
 
     locked = true;
+#endif
 
     if ((under = H5VLdataset_open(o->under_object, loc_params, o->under_vol_id, name, dapl_id, dxpl_id, req)) == NULL) {
         fprintf(stderr, "unable to open dataset in underlying connector\n");
@@ -1792,10 +2133,18 @@ H5VL_bypass_dataset_open(void *obj, const H5VL_loc_params_t *loc_params, const c
         req_created = true;
     }
 
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+        goto error;
+    }
+#else
     if (locked && pthread_mutex_unlock(&mutex_local) != 0) {
         printf("In %s of %s at line %d: pthread_mutex_unlock failed\n", __func__, __FILE__, __LINE__);
         goto error;
     }
+#endif
 
     return (void *)dset;
 
@@ -1814,8 +2163,15 @@ error:
             fprintf(stderr, "failed to clean up bypass request object after dset open failure\n");
     }
 
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#else
     if (locked)
         pthread_mutex_unlock(&mutex_local);
+#endif
 
     return NULL;
 } /* end H5VL_bypass_dataset_open() */
@@ -3049,9 +3405,20 @@ H5VL_bypass_dataset_read(size_t count, void *dset[], hid_t mem_type_id[], hid_t 
     atomic_int   local_task_count = 0;
     int          load_local_task_count = 0;;
     pthread_cond_t  local_condition;
+    bool         xs_locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL DATASET Read\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the shared lock */
+    if (BPTS_pt_rec_xs_shared_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    xs_locked = true;
 #endif
 
     pthread_cond_init(&local_condition, NULL);
@@ -3156,6 +3523,9 @@ H5VL_bypass_dataset_read(size_t count, void *dset[], hid_t mem_type_id[], hid_t 
             || dset_space_status != H5D_SPACE_STATUS_ALLOCATED || mem_space_id[j] == H5S_BLOCK
             || file_space_id[j] == H5S_BLOCK || mem_space_id[j] == H5S_PLIST || file_space_id[j] == H5S_PLIST;
 
+        /* For test only */
+        //read_use_native = true;
+
         if (read_use_native) {
             /* Let go the global lock of the HDF5 library */
 	    if (acquired_global && H5TSmutex_release(&lock_count) != 0) {
@@ -3165,6 +3535,23 @@ H5VL_bypass_dataset_read(size_t count, void *dset[], hid_t mem_type_id[], hid_t 
 	    }
 
 	    acquired_global = false;
+
+#ifdef XSLOCK
+	    /* Drop the shared lock. */
+	    if (xs_locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+		fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+	    }
+
+	    xs_locked = false;
+
+	    /* Obtain the exclusive lock */
+	    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+		fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+		goto done;
+	    }
+
+	    xs_locked = true;
+#endif
 
             /* Populate the array of under objects */
             under_vol_id = ((H5VL_bypass_t *)(dset[0]))->under_vol_id;
@@ -3183,6 +3570,27 @@ H5VL_bypass_dataset_read(size_t count, void *dset[], hid_t mem_type_id[], hid_t 
                             __FILE__, __LINE__);
                     goto done;
             }
+
+#ifdef XSLOCK
+	    /* If there are more than one dataset to read and not knowing if the Bypass VOL can handle it,
+             * prepare for the next dataset by dropping the exclusive lock and grabbing the shared lock.
+             * Otherwise, release the exclusive lock in the end of the function. */
+            if (count > 1) {
+		if (xs_locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+		    fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+		}
+
+		xs_locked = false;
+
+		/* Obtain the shared lock */
+		if (BPTS_pt_rec_xs_shared_lock(&rec_xs_lock) < 0) {
+		    fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+		    goto done;
+		}
+
+		xs_locked = true;
+            }
+#endif
         } else { /* Coming into Bypass VOL when no data conversion and filter */
             //TODO: change chunk_addr to dataset address
             if (get_dset_location(dset[j], plist_id, req, &selection_info.chunk_addr) < 0) {
@@ -3376,6 +3784,27 @@ H5VL_bypass_dataset_read(size_t count, void *dset[], hid_t mem_type_id[], hid_t 
 
         }
 
+	/* If there are more than one dataset to read, prepare for the next dataset
+         * by acquiring the global lock. */
+        if (count > 1) {
+	    if (H5TShave_mutex(&has_global) < 0) {
+		fprintf(stderr, "In %s of %s at line %d: H5TShave_mutex failed\n", __func__, __FILE__, __LINE__);
+		ret_value = -1;
+		goto done;
+	    }
+
+	    /* Grab the global lock of the HDF5 library */
+	    if (!has_global) {
+		/* TODO: Use a condition variable instead of this while loop */
+		while (!acquired_global) {
+		    if (H5TSmutex_acquire(lock_count, &acquired_global) < 0) {
+			fprintf(stderr, "In %s of %s at line %d: H5TSmutex_acquire failed\n", __func__, __FILE__, __LINE__);
+			ret_value = -1;
+			goto done;
+		    }
+		}
+	    }
+         }
     }
 
     /* Check for async request */
@@ -3434,6 +3863,13 @@ done:
 
     acquired_global = false;
 
+#ifdef XSLOCK
+    /* Drop the exclusive/shared lock. */
+    if (xs_locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
+
     return ret_value;
 } /* end H5VL_bypass_dataset_read() */
 
@@ -3478,13 +3914,23 @@ H5VL_bypass_dataset_write(size_t count, void *dset[], hid_t mem_type_id[], hid_t
     atomic_int   local_task_count = 0;
     int          load_local_task_count = 0;;
     pthread_cond_t  local_condition;
-
+    bool         xs_locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL DATASET Write\n");
 #endif
 
     //fprintf(stderr, "%s: %d\n", __func__, __LINE__);
+
+#ifdef XSLOCK
+    /* Obtain the shared lock */
+    if (BPTS_pt_rec_xs_shared_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    xs_locked = true;
+#endif
 
     pthread_cond_init(&local_condition, NULL);
 
@@ -3593,6 +4039,23 @@ H5VL_bypass_dataset_write(size_t count, void *dset[], hid_t mem_type_id[], hid_t
 	    }
 
 	    acquired_global = false;
+
+#ifdef XSLOCK
+	    /* Drop the shared lock. */
+	    if (xs_locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+		fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+	    }
+
+	    xs_locked = false;
+
+	    /* Obtain the exclusive lock */
+	    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+		fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+		goto done;
+	    }
+
+	    xs_locked = true;
+#endif
 
 	    /* Populate the array of under objects */
 	    under_vol_id = ((H5VL_bypass_t *)(dset[0]))->under_vol_id;
@@ -3726,6 +4189,28 @@ H5VL_bypass_dataset_write(size_t count, void *dset[], hid_t mem_type_id[], hid_t
                 }
             }
         }
+
+	/* If there are more than one dataset to read, prepare for the next dataset
+         * by acquiring the global lock. */
+        if (count > 1) {
+	    if (H5TShave_mutex(&has_global) < 0) {
+		fprintf(stderr, "In %s of %s at line %d: H5TShave_mutex failed\n", __func__, __FILE__, __LINE__);
+		ret_value = -1;
+		goto done;
+	    }
+
+	    /* Grab the global lock of the HDF5 library */
+	    if (!has_global) {
+		/* TODO: Use a condition variable instead of this while loop */
+		while (!acquired_global) {
+		    if (H5TSmutex_acquire(lock_count, &acquired_global) < 0) {
+			fprintf(stderr, "In %s of %s at line %d: H5TSmutex_acquire failed\n", __func__, __FILE__, __LINE__);
+			ret_value = -1;
+			goto done;
+		    }
+		}
+	    }
+         }
     }
 
     /* Check for async request */
@@ -3784,6 +4269,13 @@ done:
 
     acquired_global = false;
 
+#ifdef XSLOCK
+    /* Drop the exclusive/shared lock. */
+    if (xs_locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
+
     return ret_value;
 } /* end H5VL_bypass_dataset_write() */
 
@@ -3802,9 +4294,20 @@ H5VL_bypass_dataset_get(void *dset, H5VL_dataset_get_args_t *args, hid_t dxpl_id
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)dset;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL DATASET Get\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     ret_value = H5VLdataset_get(o->under_object, o->under_vol_id, args, dxpl_id, req);
@@ -3812,6 +4315,14 @@ H5VL_bypass_dataset_get(void *dset, H5VL_dataset_get_args_t *args, hid_t dxpl_id
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, o->under_vol_id);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_dataset_get() */
@@ -3833,10 +4344,22 @@ H5VL_bypass_dataset_specific(void *obj, H5VL_dataset_specific_args_t *args, hid_
     hid_t under_vol_id;
     herr_t ret_value = 0;
     bool req_created = false;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL H5Dspecific\n");
 #endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
+#endif
+
     assert(o->type == H5I_DATASET);
 
     // Save copy of underlying VOL connector ID and prov helper, in case of
@@ -3893,6 +4416,13 @@ done:
             H5VL_bypass_free_obj(*req);
     }
 
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
+
     return ret_value;
 } /* end H5VL_bypass_dataset_specific() */
 
@@ -3911,9 +4441,20 @@ H5VL_bypass_dataset_optional(void *obj, H5VL_optional_args_t *args, hid_t dxpl_i
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL DATASET Optional\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     ret_value = H5VLdataset_optional(o->under_object, o->under_vol_id, args, dxpl_id, req);
@@ -3921,6 +4462,14 @@ H5VL_bypass_dataset_optional(void *obj, H5VL_optional_args_t *args, hid_t dxpl_i
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, o->under_vol_id);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_dataset_optional() */
@@ -3940,10 +4489,20 @@ H5VL_bypass_dataset_close(void *dset, hid_t dxpl_id, void **req)
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)dset;
     herr_t         ret_value = 0;
-
+    bool           locked = false;
     
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL DATASET Close\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     /* Avoid assertion here because the dataset may not be opened with the dataset functions
@@ -3967,6 +4526,13 @@ H5VL_bypass_dataset_close(void *dset, hid_t dxpl_id, void **req)
         H5VL_bypass_free_obj(o);
 
 done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
+
     return ret_value;
 } /* end H5VL_bypass_dataset_close() */
 
@@ -3987,9 +4553,20 @@ H5VL_bypass_datatype_commit(void *obj, const H5VL_loc_params_t *loc_params, cons
     H5VL_bypass_t *dt = NULL;
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     void          *under = NULL;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL DATATYPE Commit\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     under = H5VLdatatype_commit(o->under_object, loc_params, o->under_vol_id, name, type_id, lcpl_id, tcpl_id,
@@ -4003,6 +4580,14 @@ H5VL_bypass_datatype_commit(void *obj, const H5VL_loc_params_t *loc_params, cons
     } /* end if */
     else
         dt = NULL;
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return (void *)dt;
 } /* end H5VL_bypass_datatype_commit() */
@@ -4024,9 +4609,20 @@ H5VL_bypass_datatype_open(void *obj, const H5VL_loc_params_t *loc_params, const 
     H5VL_bypass_t *dt = NULL;
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     void          *under = NULL;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL DATATYPE Open\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     under = H5VLdatatype_open(o->under_object, loc_params, o->under_vol_id, name, tapl_id, dxpl_id, req);
@@ -4039,6 +4635,14 @@ H5VL_bypass_datatype_open(void *obj, const H5VL_loc_params_t *loc_params, const 
     } /* end if */
     else
         dt = NULL;
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return (void *)dt;
 } /* end H5VL_bypass_datatype_open() */
@@ -4058,9 +4662,20 @@ H5VL_bypass_datatype_get(void *dt, H5VL_datatype_get_args_t *args, hid_t dxpl_id
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)dt;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL DATATYPE Get\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     ret_value = H5VLdatatype_get(o->under_object, o->under_vol_id, args, dxpl_id, req);
@@ -4068,6 +4683,14 @@ H5VL_bypass_datatype_get(void *dt, H5VL_datatype_get_args_t *args, hid_t dxpl_id
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, o->under_vol_id);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_datatype_get() */
@@ -4088,9 +4711,20 @@ H5VL_bypass_datatype_specific(void *obj, H5VL_datatype_specific_args_t *args, hi
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     hid_t          under_vol_id = H5I_INVALID_HID;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL DATATYPE Specific\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     // Save copy of underlying VOL connector ID and prov helper, in case of
@@ -4102,6 +4736,15 @@ H5VL_bypass_datatype_specific(void *obj, H5VL_datatype_specific_args_t *args, hi
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, under_vol_id);
+
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_datatype_specific() */
@@ -4121,9 +4764,20 @@ H5VL_bypass_datatype_optional(void *obj, H5VL_optional_args_t *args, hid_t dxpl_
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL DATATYPE Optional\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     ret_value = H5VLdatatype_optional(o->under_object, o->under_vol_id, args, dxpl_id, req);
@@ -4131,6 +4785,14 @@ H5VL_bypass_datatype_optional(void *obj, H5VL_optional_args_t *args, hid_t dxpl_
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, o->under_vol_id);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_datatype_optional() */
@@ -4150,9 +4812,20 @@ H5VL_bypass_datatype_close(void *dt, hid_t dxpl_id, void **req)
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)dt;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL DATATYPE Close\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     assert(o->under_object);
@@ -4166,6 +4839,14 @@ H5VL_bypass_datatype_close(void *dt, hid_t dxpl_id, void **req)
     /* Release our wrapper, if underlying datatype was closed */
     if (ret_value >= 0)
         H5VL_bypass_free_obj(o);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_datatype_close */
@@ -4255,12 +4936,22 @@ H5VL_bypass_file_create(const char *name, unsigned flags, hid_t fcpl_id, hid_t f
     printf("------- BYPASS  VOL FILE Create\n");
 #endif
 
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto error;
+    }
+
+    locked = true;
+#else
     if (pthread_mutex_lock(&mutex_local) < 0) {
         printf("In %s of %s at line %d: pthread_mutex_lock failed\n", __func__, __FILE__, __LINE__);
         goto error;
     }
 
     locked = true;
+#endif
 
     /* Get copy of our VOL info from FAPL */
     if (H5Pget_vol_info(fapl_id, (void **)&info) < 0) {
@@ -4331,10 +5022,18 @@ H5VL_bypass_file_create(const char *name, unsigned flags, hid_t fcpl_id, hid_t f
         goto error;
     }
 
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+        goto error;
+    }
+#else
     if (locked && pthread_mutex_unlock(&mutex_local) != 0) {
         printf("In %s of %s at line %d: pthread_mutex_unlock failed\n", __func__, __FILE__, __LINE__);
         goto error;
     }
+#endif
 
     return (void *)file;
 
@@ -4350,8 +5049,15 @@ error:
             H5VLfree_connector_info(info->under_vol_id, info);
     } H5E_END_TRY;
 
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#else
     if (locked)
         pthread_mutex_unlock(&mutex_local);
+#endif
 
     return NULL;
 
@@ -4399,12 +5105,22 @@ H5VL_bypass_file_open(const char *name, unsigned flags, hid_t fapl_id, hid_t dxp
     printf("------- BYPASS  VOL FILE Open\n");
 #endif
 
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto error;
+    }
+
+    locked = true;
+#else
     if (pthread_mutex_lock(&mutex_local) < 0) {
         printf("In %s of %s at line %d: pthread_mutex_lock failed\n", __func__, __FILE__, __LINE__);
         goto error;
     }
 
     locked = true;
+#endif
 
     /* Get copy of our VOL info from FAPL */
     if (H5Pget_vol_info(fapl_id, (void **)&info) < 0) {
@@ -4474,8 +5190,16 @@ H5VL_bypass_file_open(const char *name, unsigned flags, hid_t fapl_id, hid_t dxp
         goto error;
     }
 
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+        goto error;
+    }
+#else
     if (locked)
         pthread_mutex_unlock(&mutex_local);
+#endif
 
     return (void *)file;
 
@@ -4491,8 +5215,16 @@ error:
             H5VL_bypass_free_obj(*req);
     } H5E_END_TRY;
 
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+        goto error;
+    }
+#else
     if (locked)
         pthread_mutex_unlock(&mutex_local);
+#endif
 
     return NULL;
 } /* end H5VL_bypass_file_open() */
@@ -4512,10 +5244,22 @@ H5VL_bypass_file_get(void *file, H5VL_file_get_args_t *args, hid_t dxpl_id, void
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)file;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL FILE Get\n");
 #endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
+#endif
+
     assert(o->under_object);
 
     if (H5VLfile_get(o->under_object, o->under_vol_id, args, dxpl_id, req) < 0) {
@@ -4534,6 +5278,13 @@ H5VL_bypass_file_get(void *file, H5VL_file_get_args_t *args, hid_t dxpl_id, void
     }
 
 done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
+
     return ret_value;
 } /* end H5VL_bypass_file_get() */
 
@@ -4551,15 +5302,26 @@ static herr_t
 H5VL_bypass_file_specific(void *file, H5VL_file_specific_args_t *args, hid_t dxpl_id, void **req)
 {
     H5VL_bypass_t             *o = (H5VL_bypass_t *)file;
-    H5VL_bypass_t             *new_o;
+    H5VL_bypass_t             *new_o = NULL;
     H5VL_file_specific_args_t  my_args;
     H5VL_file_specific_args_t *new_args;
-    H5VL_bypass_info_t        *info;
+    H5VL_bypass_info_t        *info = NULL;
     hid_t                      under_vol_id = -1;
     herr_t                     ret_value = 0;
+    bool                       locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL FILE Specific\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto error;
+    }
+
+    locked = true;
 #endif
 
     assert(o == NULL || o->type == H5I_FILE);
@@ -4677,11 +5439,25 @@ H5VL_bypass_file_specific(void *file, H5VL_file_specific_args_t *args, hid_t dxp
         }
     } /* end else */
 
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
+
     return ret_value;
 
 error:
     if (new_o)
         H5VL_bypass_free_obj(new_o);
+
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return -1;
 } /* end H5VL_bypass_file_specific() */
@@ -4700,10 +5476,22 @@ static herr_t
 H5VL_bypass_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id, void **req)
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)file;
-    herr_t         ret_value;
+    herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL File Optional\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        ret_value = -1;
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     ret_value = H5VLfile_optional(o->under_object, o->under_vol_id, args, dxpl_id, req);
@@ -4711,6 +5499,15 @@ H5VL_bypass_file_optional(void *file, H5VL_optional_args_t *args, hid_t dxpl_id,
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, o->under_vol_id);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+        ret_value = -1;
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_file_optional() */
@@ -4729,17 +5526,28 @@ static herr_t
 H5VL_bypass_file_close(void *file, hid_t dxpl_id, void **req)
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)file;
-    herr_t         ret_value;
+    herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL FILE Close\n");
 #endif
 
-    assert(o->type == H5I_FILE);
-    assert(o->u.file.ref_count > 0);
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
 
+    locked = true;
+#else
     /* Release our wrapper, if underlying file was closed */
     pthread_mutex_lock(&mutex_local);
+#endif
+
+    assert(o->type == H5I_FILE);
+    assert(o->u.file.ref_count > 0);
 
     /* Pass close request to underlying VOL connector */
     if ((ret_value = H5VLfile_close(o->under_object, o->under_vol_id, dxpl_id, req)) < 0) {
@@ -4758,7 +5566,14 @@ H5VL_bypass_file_close(void *file, hid_t dxpl_id, void **req)
     }
 
 done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#else
     pthread_mutex_unlock(&mutex_local);
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_file_close() */
@@ -4787,12 +5602,22 @@ H5VL_bypass_group_create(void *obj, const H5VL_loc_params_t *loc_params, const c
     printf("------- BYPASS  VOL GROUP Create\n");
 #endif
 
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto error;
+    }
+
+    locked = true;
+#else
     if (pthread_mutex_lock(&mutex_local) < 0) {
         printf("In %s of %s at line %d: pthread_mutex_lock failed\n", __func__, __FILE__, __LINE__);
         goto error;
     }
 
     locked = true;
+#endif
 
     if ((under = H5VLgroup_create(o->under_object, loc_params,
          o->under_vol_id, name, lcpl_id, gcpl_id, gapl_id, dxpl_id, req)) == NULL) {
@@ -4825,15 +5650,31 @@ H5VL_bypass_group_create(void *obj, const H5VL_loc_params_t *loc_params, const c
     parent_file->u.file.ref_count++;
     group->u.group.file = parent_file;
 
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+        goto error;
+    }
+#else
     if (locked && pthread_mutex_unlock(&mutex_local) != 0) {
         printf("In %s of %s at line %d: pthread_mutex_unlock failed\n", __func__, __FILE__, __LINE__);
         goto error;
     }
+#endif
 
     return (void *)group;
+
 error:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#else
     if (locked)
         pthread_mutex_unlock(&mutex_local);
+#endif
 
     return NULL;
 } /* end H5VL_bypass_group_create() */
@@ -4862,12 +5703,22 @@ H5VL_bypass_group_open(void *obj, const H5VL_loc_params_t *loc_params, const cha
     printf("------- BYPASS  VOL GROUP Open\n");
 #endif
 
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto error;
+    }
+
+    locked = true;
+#else
     if (pthread_mutex_lock(&mutex_local) < 0) {
         printf("In %s of %s at line %d: pthread_mutex_lock failed\n", __func__, __FILE__, __LINE__);
         goto error;
     }
 
     locked = true;
+#endif
 
     if ((under = H5VLgroup_open(o->under_object,
         loc_params, o->under_vol_id, name, gapl_id, dxpl_id, req)) == NULL) {
@@ -4900,15 +5751,31 @@ H5VL_bypass_group_open(void *obj, const H5VL_loc_params_t *loc_params, const cha
     parent_file->u.file.ref_count++;
     group->u.group.file = parent_file;
 
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+        goto error;
+    }
+#else
     if (locked && pthread_mutex_unlock(&mutex_local) != 0) {
         printf("In %s of %s at line %d: pthread_mutex_unlock failed\n", __func__, __FILE__, __LINE__);
         goto error;
     }
+#endif
 
     return (void *)group;
 error:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+        goto error;
+    }
+#else
     if (locked)
         pthread_mutex_unlock(&mutex_local);
+#endif
 
     return NULL;
 } /* end H5VL_bypass_group_open() */
@@ -4928,9 +5795,20 @@ H5VL_bypass_group_get(void *obj, H5VL_group_get_args_t *args, hid_t dxpl_id, voi
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL GROUP Get\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     ret_value = H5VLgroup_get(o->under_object, o->under_vol_id, args, dxpl_id, req);
@@ -4938,6 +5816,14 @@ H5VL_bypass_group_get(void *obj, H5VL_group_get_args_t *args, hid_t dxpl_id, voi
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, o->under_vol_id);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_group_get() */
@@ -4960,9 +5846,20 @@ H5VL_bypass_group_specific(void *obj, H5VL_group_specific_args_t *args, hid_t dx
     H5VL_group_specific_args_t *new_args = NULL;
     hid_t                       under_vol_id = H5I_INVALID_HID;
     herr_t                      ret_value = 0;
+    bool                        locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL GROUP Specific\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     // Save copy of underlying VOL connector ID and prov helper, in case of
@@ -4990,6 +5887,14 @@ H5VL_bypass_group_specific(void *obj, H5VL_group_specific_args_t *args, hid_t dx
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, under_vol_id);
 
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
+
     return ret_value;
 } /* end H5VL_bypass_group_specific() */
 
@@ -5008,9 +5913,20 @@ H5VL_bypass_group_optional(void *obj, H5VL_optional_args_t *args, hid_t dxpl_id,
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL GROUP Optional\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     ret_value = H5VLgroup_optional(o->under_object, o->under_vol_id, args, dxpl_id, req);
@@ -5018,6 +5934,14 @@ H5VL_bypass_group_optional(void *obj, H5VL_optional_args_t *args, hid_t dxpl_id,
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, o->under_vol_id);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_group_optional() */
@@ -5037,9 +5961,20 @@ H5VL_bypass_group_close(void *grp, hid_t dxpl_id, void **req)
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)grp;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL GROUP Close\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock. */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     /* Avoid assertion here because the group may not be opened with the group functions
@@ -5057,6 +5992,14 @@ H5VL_bypass_group_close(void *grp, hid_t dxpl_id, void **req)
     /* Release our wrapper, if underlying file was closed */
     if (ret_value >= 0)
         H5VL_bypass_free_obj(o);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_group_close() */
@@ -5080,9 +6023,20 @@ H5VL_bypass_link_create(H5VL_link_create_args_t *args, void *obj, const H5VL_loc
     H5VL_bypass_t           *o            = (H5VL_bypass_t *)obj;
     hid_t                    under_vol_id = -1;
     herr_t                   ret_value = 0;
+    bool                     locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL LINK Create\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     /* Try to retrieve the "under" VOL id */
@@ -5121,6 +6075,14 @@ H5VL_bypass_link_create(H5VL_link_create_args_t *args, void *obj, const H5VL_loc
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, under_vol_id);
 
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
+
     return ret_value;
 } /* end H5VL_bypass_link_create() */
 
@@ -5147,9 +6109,20 @@ H5VL_bypass_link_copy(void *src_obj, const H5VL_loc_params_t *loc_params1, void 
     H5VL_bypass_t *o_dst        = (H5VL_bypass_t *)dst_obj;
     hid_t          under_vol_id = -1;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL LINK Copy\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     /* Retrieve the "under" VOL id */
@@ -5166,6 +6139,14 @@ H5VL_bypass_link_copy(void *src_obj, const H5VL_loc_params_t *loc_params1, void 
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, under_vol_id);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock. */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_link_copy() */
@@ -5194,9 +6175,20 @@ H5VL_bypass_link_move(void *src_obj, const H5VL_loc_params_t *loc_params1, void 
     H5VL_bypass_t *o_dst        = (H5VL_bypass_t *)dst_obj;
     hid_t          under_vol_id = -1;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL LINK Move\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     /* Retrieve the "under" VOL id */
@@ -5213,6 +6205,14 @@ H5VL_bypass_link_move(void *src_obj, const H5VL_loc_params_t *loc_params1, void 
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, under_vol_id);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_link_move() */
@@ -5233,9 +6233,20 @@ H5VL_bypass_link_get(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_g
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL LINK Get\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     ret_value = H5VLlink_get(o->under_object, loc_params, o->under_vol_id, args, dxpl_id, req);
@@ -5243,6 +6254,14 @@ H5VL_bypass_link_get(void *obj, const H5VL_loc_params_t *loc_params, H5VL_link_g
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, o->under_vol_id);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_link_get() */
@@ -5263,9 +6282,20 @@ H5VL_bypass_link_specific(void *obj, const H5VL_loc_params_t *loc_params, H5VL_l
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL LINK Specific\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     ret_value = H5VLlink_specific(o->under_object, loc_params, o->under_vol_id, args, dxpl_id, req);
@@ -5273,6 +6303,14 @@ H5VL_bypass_link_specific(void *obj, const H5VL_loc_params_t *loc_params, H5VL_l
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, o->under_vol_id);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_link_specific() */
@@ -5293,9 +6331,20 @@ H5VL_bypass_link_optional(void *obj, const H5VL_loc_params_t *loc_params, H5VL_o
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL LINK Optional\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     ret_value = H5VLlink_optional(o->under_object, loc_params, o->under_vol_id, args, dxpl_id, req);
@@ -5303,6 +6352,14 @@ H5VL_bypass_link_optional(void *obj, const H5VL_loc_params_t *loc_params, H5VL_o
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, o->under_vol_id);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_link_optional() */
@@ -5326,8 +6383,20 @@ H5VL_bypass_object_open(void *obj, const H5VL_loc_params_t *loc_params, H5I_type
     H5VL_bypass_t *parent_file = NULL;
     void          *under = NULL;
     bool           req_created = false;
+    bool           locked = false;
+
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL OBJECT Open\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto error;
+    }
+
+    locked = true;
 #endif
 
     if ((under = H5VLobject_open(o->under_object, loc_params, o->under_vol_id, opened_type, dxpl_id, req)) == NULL) {
@@ -5385,6 +6454,14 @@ H5VL_bypass_object_open(void *obj, const H5VL_loc_params_t *loc_params, H5I_type
         req_created = true;
     }
 
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+        goto error;
+    }
+#endif
+
     return (void *)new_obj;
 
 error:
@@ -5392,6 +6469,13 @@ error:
         H5VL_bypass_free_obj(new_obj);
     if (req && *req && req_created)
         H5VL_bypass_free_obj(*req);
+
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return NULL;
 } /* end H5VL_bypass_object_open() */
@@ -5414,9 +6498,20 @@ H5VL_bypass_object_copy(void *src_obj, const H5VL_loc_params_t *src_loc_params, 
     H5VL_bypass_t *o_src = (H5VL_bypass_t *)src_obj;
     H5VL_bypass_t *o_dst = (H5VL_bypass_t *)dst_obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL OBJECT Copy\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     ret_value =
@@ -5426,6 +6521,14 @@ H5VL_bypass_object_copy(void *src_obj, const H5VL_loc_params_t *src_loc_params, 
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, o_src->under_vol_id);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_object_copy() */
@@ -5446,9 +6549,20 @@ H5VL_bypass_object_get(void *obj, const H5VL_loc_params_t *loc_params, H5VL_obje
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL OBJECT Get\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     ret_value = H5VLobject_get(o->under_object, loc_params, o->under_vol_id, args, dxpl_id, req);
@@ -5456,6 +6570,14 @@ H5VL_bypass_object_get(void *obj, const H5VL_loc_params_t *loc_params, H5VL_obje
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, o->under_vol_id);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_object_get() */
@@ -5477,9 +6599,20 @@ H5VL_bypass_object_specific(void *obj, const H5VL_loc_params_t *loc_params, H5VL
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     hid_t          under_vol_id = H5I_INVALID_HID;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL OBJECT Specific\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     // Save copy of underlying VOL connector ID and prov helper, in case of
@@ -5491,6 +6624,14 @@ H5VL_bypass_object_specific(void *obj, const H5VL_loc_params_t *loc_params, H5VL
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, under_vol_id);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_object_specific() */
@@ -5511,9 +6652,20 @@ H5VL_bypass_object_optional(void *obj, const H5VL_loc_params_t *loc_params, H5VL
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL OBJECT Optional\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     ret_value = H5VLobject_optional(o->under_object, loc_params, o->under_vol_id, args, dxpl_id, req);
@@ -5521,6 +6673,14 @@ H5VL_bypass_object_optional(void *obj, const H5VL_loc_params_t *loc_params, H5VL
     /* Check for async request */
     if (req && *req)
         *req = H5VL_bypass_new_obj(*req, o->under_vol_id);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_object_optional() */
@@ -5627,12 +6787,31 @@ H5VL_bypass_request_wait(void *obj, uint64_t timeout, H5VL_request_status_t *sta
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL REQUEST Wait\n");
 #endif
 
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
+#endif
+
     ret_value = H5VLrequest_wait(o->under_object, o->under_vol_id, timeout, status);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_request_wait() */
@@ -5655,12 +6834,31 @@ H5VL_bypass_request_notify(void *obj, H5VL_request_notify_t cb, void *ctx)
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL REQUEST Notify\n");
 #endif
 
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
+#endif
+
     ret_value = H5VLrequest_notify(o->under_object, o->under_vol_id, cb, ctx);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_request_notify() */
@@ -5682,12 +6880,31 @@ H5VL_bypass_request_cancel(void *obj, H5VL_request_status_t *status)
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL REQUEST Cancel\n");
 #endif
 
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
+#endif
+
     ret_value = H5VLrequest_cancel(o->under_object, o->under_vol_id, status);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_request_cancel() */
@@ -5707,12 +6924,31 @@ H5VL_bypass_request_specific(void *obj, H5VL_request_specific_args_t *args)
 {
     H5VL_bypass_t *o         = (H5VL_bypass_t *)obj;
     herr_t         ret_value = -1;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL REQUEST Specific\n");
 #endif
 
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
+#endif
+
     ret_value = H5VLrequest_specific(o->under_object, o->under_vol_id, args);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_request_specific() */
@@ -5732,12 +6968,31 @@ H5VL_bypass_request_optional(void *obj, H5VL_optional_args_t *args)
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL REQUEST Optional\n");
 #endif
 
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
+#endif
+
     ret_value = H5VLrequest_optional(o->under_object, o->under_vol_id, args);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_request_optional() */
@@ -5758,15 +7013,34 @@ H5VL_bypass_request_free(void *obj)
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL REQUEST Free\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     ret_value = H5VLrequest_free(o->under_object, o->under_vol_id);
 
     if (ret_value >= 0)
         H5VL_bypass_free_obj(o);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_request_free() */
@@ -5785,12 +7059,31 @@ H5VL_bypass_blob_put(void *obj, const void *buf, size_t size, void *blob_id, voi
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL BLOB Put\n");
 #endif
 
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
+#endif
+
     ret_value = H5VLblob_put(o->under_object, o->under_vol_id, buf, size, blob_id, ctx);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_blob_put() */
@@ -5809,12 +7102,31 @@ H5VL_bypass_blob_get(void *obj, const void *blob_id, void *buf, size_t size, voi
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL BLOB Get\n");
 #endif
 
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
+#endif
+
     ret_value = H5VLblob_get(o->under_object, o->under_vol_id, blob_id, buf, size, ctx);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_blob_get() */
@@ -5833,12 +7145,31 @@ H5VL_bypass_blob_specific(void *obj, void *blob_id, H5VL_blob_specific_args_t *a
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL BLOB Specific\n");
 #endif
 
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
+#endif
+
     ret_value = H5VLblob_specific(o->under_object, o->under_vol_id, blob_id, args);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_blob_specific() */
@@ -5857,12 +7188,31 @@ H5VL_bypass_blob_optional(void *obj, void *blob_id, H5VL_optional_args_t *args)
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL BLOB Optional\n");
 #endif
 
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
+#endif
+
     ret_value = H5VLblob_optional(o->under_object, o->under_vol_id, blob_id, args);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_blob_optional() */
@@ -5883,9 +7233,20 @@ H5VL_bypass_token_cmp(void *obj, const H5O_token_t *token1, const H5O_token_t *t
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL TOKEN Compare\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     /* Sanity checks */
@@ -5895,6 +7256,14 @@ H5VL_bypass_token_cmp(void *obj, const H5O_token_t *token1, const H5O_token_t *t
     assert(cmp_value);
 
     ret_value = H5VLtoken_cmp(o->under_object, o->under_vol_id, token1, token2, cmp_value);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_token_cmp() */
@@ -5914,9 +7283,20 @@ H5VL_bypass_token_to_str(void *obj, H5I_type_t obj_type, const H5O_token_t *toke
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL TOKEN To string\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     /* Sanity checks */
@@ -5925,6 +7305,14 @@ H5VL_bypass_token_to_str(void *obj, H5I_type_t obj_type, const H5O_token_t *toke
     assert(token_str);
 
     ret_value = H5VLtoken_to_str(o->under_object, obj_type, o->under_vol_id, token, token_str);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_token_to_str() */
@@ -5944,9 +7332,20 @@ H5VL_bypass_token_from_str(void *obj, H5I_type_t obj_type, const char *token_str
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS  VOL TOKEN From string\n");
+#endif
+
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
 #endif
 
     /* Sanity checks */
@@ -5955,6 +7354,14 @@ H5VL_bypass_token_from_str(void *obj, H5I_type_t obj_type, const char *token_str
     assert(token_str);
 
     ret_value = H5VLtoken_from_str(o->under_object, obj_type, o->under_vol_id, token_str, token);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_token_from_str() */
@@ -5973,12 +7380,31 @@ H5VL_bypass_optional(void *obj, H5VL_optional_args_t *args, hid_t dxpl_id, void 
 {
     H5VL_bypass_t *o = (H5VL_bypass_t *)obj;
     herr_t         ret_value = 0;
+    bool           locked = false;
 
 #ifdef ENABLE_BYPASS_LOGGING
     printf("------- BYPASS VOL generic Optional\n");
 #endif
 
+#ifdef XSLOCK
+    /* Obtain the exclusive lock */
+    if (BPTS_pt_rec_xs_exclusive_lock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_exclusive_lock failed\n", __func__, __LINE__);
+        goto done;
+    }
+
+    locked = true;
+#endif
+
     ret_value = H5VLoptional(o->under_object, o->under_vol_id, args, dxpl_id, req);
+
+done:
+#ifdef XSLOCK
+    /* Drop the exclusive lock */
+    if (locked && BPTS_pt_rec_xs_unlock(&rec_xs_lock) < 0) {
+        fprintf(stderr, "%s at %d: BPTS_pt_rec_xs_unlock failed\n", __func__, __LINE__);
+    }
+#endif
 
     return ret_value;
 } /* end H5VL_bypass_optional() */
@@ -6130,15 +7556,15 @@ release_file_info(Bypass_file_t *file) {
     assert(file);
 
     /* Wait until all thread in the thread pool finish reading the data before
-     * closing the C file */
-    pthread_mutex_lock(&mutex_local);
+     * closing the C file.  The caller function already has the mutex */
+    //pthread_mutex_lock(&mutex_local);
 
     if (file->read_started) {
         while (file->num_reads)
             pthread_cond_wait(&(file->close_ready), &mutex_local);
     }
 
-    pthread_mutex_unlock(&mutex_local);
+    //pthread_mutex_unlock(&mutex_local);
 
     /* Clean up the file object */
     if (close(file->fd) < 0) {

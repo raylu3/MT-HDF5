@@ -7,7 +7,7 @@ This VOL connector was tested with the version of the HDF5 1.14.2 release with m
 If you don't have the shared dynamic libraries, you'll need to reinstall HDF5.
 
 - Get the 1.14.2 release of HDF5 with multithread support located at https://github.com/LifeboatLLC/hdf5_lifeboat (the 1_14_2_multithread branch);
-- The recent version has a bug.  To avoid it temporarily, you can check out an earlier version (a92a9b5) by doing 'git checkout a92a9b5'.
+- The recent version has a bug.  To avoid it temporarily, you can check out an earlier version (a92a9b5) by doing ``git checkout a92a9b5```
 - A side note: the implementation of Exclusive-shared lock will finish soon. Before that happens, the Bypass VOL uses the global lock of the HDF5 library as a temporary solution.  The users need to manually add a public function H5TShave_mutex into the HDF5 library's source code. In hdf5/src/H5TSdevelop.h, add the function prototype: ```H5_DLL herr_t H5TShave_mutex(bool *have_mutex_ptr);```
 In hdf5/src/H5TS.c, add the following function definition: 
 ```
@@ -34,7 +34,7 @@ If you're using CMake, change the following path through ccmake or cmake:
 - **CMAKE_INSTALL_PREFIX**: path to your hdf5 install/build location, such as hdf5_build/hdf5/
 
 ### Build the Bypass VOL library
-Type *make* in the source dir and you'll see **libh5bypass_vol.so** (on Linux) or **libh5bypass_vol.dylib** (on Mac OS), which is the Bypass VOL connector library.
+Type *make* in the source dir and you'll see **libh5bypass_vol.so** (on Linux) or **libh5bypass_vol.dylib** (on Mac OS), which is the Bypass VOL connector library.  You can comment out the line ```LOCK=-DXSLOCK``` in the Makefile if you don't want to use the Exclusive/Shared Lock.
 
 ### Build the performance benchmark and run it
 The benchmark programs are under test/ directory.  Simply use the Makefile provided and change the following path:
@@ -92,3 +92,6 @@ The full list of command line options for the test programs (both h5_read.c and 
 		The other options are unsurppoted
 	[-t --nThreads]: number of child threads in addition to the main process.  The default is 1.
 	[-z --deflateLevel]: for testing reading chunked data compressed with GZIP (1 - 9).  The default is 0 (no compression).
+
+### Known Issues
+- The API test of the HDF5 library (1_14_2_multithread branch) doesn't work correctly because the library isn't totally thread-safe.  It hangs in the beggining of the test.  Using the Exclusive/Shared Lock has similar problems.

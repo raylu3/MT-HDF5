@@ -5,10 +5,13 @@ CC=clang
 AR=ar
 
 # DEBUG=-DENABLE_BYPASS_LOGGING -g -O0
-DEBUG=-pthread -O3
+DEBUG=-pthread -g
+
+# Comment out this line if you want to skip the exclusive/shared lock
+LOCK=-DXSLOCK
 
 INCLUDES=-I$(HDF5_DIR)/include
-CFLAGS = $(DEBUG) -fPIC $(INCLUDES) -Wall
+CFLAGS = $(LOCK) $(DEBUG) -fPIC $(INCLUDES) -Wall
 
 LIBS=-L$(HDF5_DIR)/lib -lhdf5 -lz
 
@@ -21,7 +24,7 @@ DYNLDFLAGS = $(DEBUG) -dynamiclib -current_version 1.0 -fPIC $(LIBS)
 LDFLAGS = $(DEBUG) $(LIBS)
 ARFLAGS = rs
 
-DYNSRC = H5VLbypass.c
+DYNSRC = H5VLbypass.c BPTS.c
 DYNOBJ = $(DYNSRC:.c=.o)
 
 # Uncomment this line Linux builds:

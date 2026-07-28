@@ -44,6 +44,13 @@
 pthread_mutex_t mutex_local;
 pthread_cond_t  cond_local;
 
+#ifdef XSLOCK
+/* For exclusive/shared lock */
+struct  BPTS_pt_rec_xs_lock_stats_t stats;
+struct  BPTS_pt_rec_xs_lock_t rec_xs_lock;
+int64_t calls_to_x2s_func = 0;
+#endif
+
 int  nthreads_tpool       = NUM_LOCAL_THREADS;
 int  nsteps_tpool         = THREAD_STEP;
 int64_t  nelmts_max       = MB;
